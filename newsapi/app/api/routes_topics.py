@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from ..core.db import get_session
@@ -30,3 +30,37 @@ async def articles_by_topic(topic: str, limit: int = 50, offset: int = 0, db: As
     """)
     res = await db.execute(sql, {"topic": topic, "limit": limit, "offset": offset})
     return [dict(r) for r in res]
+
+@router.get("/{topic_name}")
+async def get_topic_details(
+    topic_name: str, 
+    db: AsyncSession = Depends(get_session)
+):
+    """Détails d'un topic spécifique"""
+    # Récupérer stats du topic
+    sql_stats = text("""
+        SELECT COUNT(*) as article_count
+        FROM articles
+        WHERE topics @> ARRAY[:topic]
+    """)
+    
+    # Récupérer articles récents du topic
+    sql_articles = text("""
+        SELECT id, title, canonical_url, domain, published_at
+        FROM articles
+        WHERE topics @> ARRAY[:topic]
+        ORDER BY published_at DESC NULLS LAST
+        LIMIT 5
+    """)
+    
+    stats = (await db.execute(sql_stats, {"topic": topic_name})).fetchone()
+    articles = (await db.execute(sql_articles, {"topic": topic_name})).mappings().all()
+    
+    if stats[0] == 0:
+        raise HTTPException(404, f"Topic '{topic_name}' not found")
+    
+    return {
+        "topic": topic_name,
+        "article_count": stats[0],
+        "recent_articles": [dict(r) for r in articles]
+    }

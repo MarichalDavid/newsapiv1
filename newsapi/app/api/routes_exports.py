@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, Response, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from ..core.db import get_session
 from ..core.schemas import Filters
 from ..services.queries import list_articles
+from sqlalchemy import text
 
 router = APIRouter(prefix="/exports", tags=["exports"])
 
@@ -49,3 +50,55 @@ async def export_articles_csv(
             csvsafe(";".join(a.topics or []))
         ]))
     return Response(content="\n".join(rows), media_type="text/csv")
+
+@router.get("/sentiment.csv")
+async def export_sentiment_csv(
+    days: int = Query(7, ge=1, le=90),
+    db: AsyncSession = Depends(get_session)
+):
+    """Export CSV des données de sentiment"""
+    # ✅ CORRECTION : Convertir en string pour la concaténation PostgreSQL
+    sql = text("""
+        SELECT d, domain, pos_count, neu_count, neg_count
+        FROM source_sentiment_daily
+        WHERE d >= NOW() - (:days || ' days')::interval
+        ORDER BY d DESC, domain
+    """)
+    
+    # ✅ CORRECTION : Convertir l'entier en string pour la concaténation
+    rows = (await db.execute(sql, {"days": str(days)})).mappings().all()
+    
+    csv_rows = ["date,domain,positive,neutral,negative"]
+    for r in rows:
+        csv_rows.append(f"{r['d']},{r['domain']},{r['pos_count']},{r['neu_count']},{r['neg_count']}")
+    
+    return Response(content="\n".join(csv_rows), media_type="text/csv")
+
+@router.get("/topics.json")
+async def export_topics_json(db: AsyncSession = Depends(get_session)):
+    """Export JSON des topics"""
+    sql = text("""
+        SELECT unnest(topics) AS topic, COUNT(*) AS count
+        FROM articles
+        WHERE topics IS NOT NULL
+        GROUP BY topic
+        ORDER BY count DESC
+    """)
+    
+    rows = (await db.execute(sql)).mappings().all()
+    return [dict(r) for r in rows]
+
+@router.get("/stats.json")
+async def export_stats_json(db: AsyncSession = Depends(get_session)):
+    """Export JSON des statistiques"""
+    # Réutiliser la logique de routes_stats.py
+    sql = text("""
+        SELECT 
+            COUNT(*) as total_articles,
+            COUNT(DISTINCT domain) as unique_domains,
+            COUNT(DISTINCT cluster_id) as total_clusters
+        FROM articles
+    """)
+    
+    result = (await db.execute(sql)).mappings().first()
+    return dict(result)
