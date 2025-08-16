@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import List, Optional, Any
 from datetime import datetime
 
@@ -13,25 +13,26 @@ class SourceIn(BaseModel):
 
 class SourceOut(SourceIn):
     id: int
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class ArticleOut(BaseModel):
     id: int
     source_id: int
+    url: str
     canonical_url: str
     domain: str
     title: str
-    summary_final: Optional[str] = None
-    summary_source: Optional[str] = None
+    summary_feed: Optional[str] = None
     published_at: Optional[datetime] = None
+    authors: Optional[List[str]] = None
+    full_text: Optional[str] = None
     lang: Optional[str] = None
-    keywords: Optional[List[str]] = None
-    topics: Optional[List[str]] = None
-    url: str
+    summary_final: Optional[str] = None
+    fetched_at: Optional[datetime] = None
+    model_config = ConfigDict(from_attributes=True)
 
-    class Config:
-        from_attributes = True
+class Config:
+    from_attributes = True
 
 class ArticleDetail(ArticleOut):
     summary_feed: Optional[str] = None

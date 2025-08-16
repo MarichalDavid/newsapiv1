@@ -1,129 +1,315 @@
+# app/services/collector.py - Corrections timezone
+
+import asyncio
+import hashlib
+import logging
+from datetime import datetime, timedelta, timezone
+from typing import List, Dict, Any, Optional
+from urllib.parse import urljoin, urlparse
+import aiohttp
+import feedparser
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert
+
 from ..core.models import Source, Article
-from ..services.discovery import fetch_feed, parse_feed
-from ..services.sitemap import discover_from_sitemap
-from ..services.enrichment import enrich_html
-from ..services.normalize import guess_lang
-from ..services.dedupe import content_hash
-from ..services.summarize import choose_summary
-from ..services.nlp_keywords import extract_keywords
-from ..services.nlp_entities import extract_entities
-from ..utils.url import canonical_url
-from urllib.parse import urlparse
-from datetime import datetime
-from simhash import Simhash
-import traceback
-from ..services.normalize import to_utc_naive
+from ..core.db import get_session
 
-def simhash_int63(text: str) -> int:
-    from simhash import Simhash
-    v = Simhash(text).value           # 64-bit non signé
-    return v & ((1 << 63) - 1)        # clamp en [0 .. 2^63-1]
+logger = logging.getLogger(__name__)
 
-
-async def run_collection_once(db: AsyncSession):
-    res = await db.execute(
-        select(
-            Source.id, Source.feed_url, Source.site_domain,
-            Source.etag, Source.last_modified, Source.enrichment
-        ).where(Source.active == True)
-    )
-    sources = [dict(r) for r in res.mappings().all()]
-    print(f"[collector] active sources: {len(sources)}", flush=True)
-
-    for s in sources:
+class CollectorService:
+    """Service principal de collecte d'articles"""
+    
+    def __init__(self):
+        self.session_timeout = aiohttp.ClientTimeout(total=30)
+        self.max_articles_per_source = 50
+    
+    def normalize_datetime(self, dt: Optional[datetime]) -> Optional[datetime]:
+        """✅ NOUVELLE FONCTION: Normalise les datetime pour PostgreSQL"""
+        if dt is None:
+            return None
+        
+        # Si le datetime a un timezone, le convertir en UTC puis retirer le timezone
+        if dt.tzinfo is not None:
+            # Convertir en UTC
+            dt_utc = dt.astimezone(timezone.utc)
+            # Retirer le timezone info pour PostgreSQL TIMESTAMP WITHOUT TIME ZONE
+            return dt_utc.replace(tzinfo=None)
+        
+        # Si pas de timezone, on assume que c'est déjà en UTC
+        return dt
+        
+    async def fetch_feed_content(self, session: aiohttp.ClientSession, url: str) -> str:
+        """Récupère le contenu d'un feed RSS/XML"""
         try:
-            status, r = fetch_feed(s["feed_url"], s["etag"], s["last_modified"])
-            items = []
-            if status != 304 and status < 400:
-                et = r.headers.get("ETag"); lm = r.headers.get("Last-Modified")
-                if et or lm:
-                    await db.execute(
-                        update(Source).where(Source.id==s["id"]).values(
-                            etag=et, last_modified=lm, updated_at=datetime.utcnow()
-                        )
-                    )
-                items = list(parse_feed(r.content))
-            if not items:
-                sm = discover_from_sitemap(s["site_domain"], limit=20)
-                for u in sm:
-                    items.append({"title": None, "link": u["url"], "summary": None,
-                                  "published": None, "authors": None, "raw": None})
-            print(f"[collector] {s['site_domain']} items={len(items)}", flush=True)
-
-            for item in items[:20]:  # limiter pour le premier run
+            async with session.get(url, timeout=self.session_timeout) as response:
+                if response.status == 200:
+                    content = await response.text()
+                    return content
+                else:
+                    logger.warning(f"HTTP {response.status} for {url}")
+                    return ""
+        except Exception as e:
+            logger.error(f"Fetch error for {url}: {e}")
+            return ""
+    
+    def parse_rss_feed(self, content: str, source_url: str) -> List[Dict[str, Any]]:
+        """Parse un feed RSS de manière robuste"""
+        try:
+            if not content or len(content.strip()) < 50:
+                logger.warning(f"Content too short for {source_url}")
+                return []
+            
+            feed = feedparser.parse(content)
+            
+            if hasattr(feed, 'bozo') and feed.bozo:
+                logger.warning(f"RSS parsing warning for {source_url}: {feed.bozo_exception}")
+            
+            if not hasattr(feed, 'entries') or len(feed.entries) == 0:
+                logger.warning(f"No entries found in RSS feed for {source_url}")
+                return []
+            
+            articles = []
+            for entry in feed.entries[:self.max_articles_per_source]:
                 try:
-                    url = canonical_url(item.get("link"))
-                    if not url:
+                    title = getattr(entry, 'title', 'No title').strip()
+                    link = getattr(entry, 'link', '').strip()
+                    summary = getattr(entry, 'summary', '').strip()
+                    
+                    if not title or not link:
                         continue
-                    domain = urlparse(url).netloc
-                    published_at = to_utc_naive(item.get("published"))
-                    title = item.get("title") or "(untitled)"
-                    summary_feed = item.get("summary")
-                    authors = item.get("authors")
-
-                    full_text = None
-                    if s["enrichment"] == "html":
-                        try:
-                            enr = enrich_html(url)
-                            full_text = enr.get("full_text")
-                        except Exception:
-                            full_text = None
-
-                    summary_final, summary_source, summary_llm = choose_summary(summary_feed, full_text)
-                    lang = guess_lang(full_text or summary_final or title) or None
-                    kws = extract_keywords(full_text or summary_final or title, lang=lang or "en") or []
-
-                    topics = []
-                    for k in kws:
-                        kl = k.lower()
-                        if any(x in kl for x in ["bank","banque","financ","bourse","crypto"]): topics.append("economie")
-                        if any(x in kl for x in ["politic","diplom","election","parlement"]): topics.append("politique")
-                        if any(x in kl for x in ["ai","intelligence artificielle","machine learning","ml"]): topics.append("tech")
-                        if any(x in kl for x in ["sport","match","league"]): topics.append("sport")
-                    topics = list(dict.fromkeys(topics)) or None
-
-                    text_for_hash = full_text or (title + (summary_feed or ""))
-                    h = content_hash(text_for_hash)
-                    sh = simhash_int63(full_text or title or "")
-                    cluster_id = hex(sh)[2:6]
-
-                    # Utiliser INSERT ... ON CONFLICT DO NOTHING pour gérer les doublons
-                    stmt = insert(Article).values(
-                        source_id=s["id"],
-                        url=url, canonical_url=url, domain=domain,
-                        title=title, summary_feed=summary_feed, published_at=published_at,
-                        authors=authors, full_text=full_text, jsonld=None, lang=lang,
-                        keywords=kws, entities=extract_entities(full_text or summary_final or "", lang=lang or "en"),
-                        summary_llm=summary_llm, summary_final=summary_final, summary_source=summary_source,
-                        topics=topics, content_hash=h, simhash=sh, cluster_id=cluster_id,
-                        status="processed", raw=item.get("raw")
-                    )
-                    stmt = stmt.on_conflict_do_nothing(index_elements=['canonical_url'])
-                    result = await db.execute(stmt)
                     
-                    # Log si l'article a été inséré ou ignoré
-                    if result.rowcount == 0:
-                        print(f"[collector] duplicate URL ignored: {url}", flush=True)
-                    else:
-                        print(f"[collector] article inserted: {url}", flush=True)
+                    article_data = {
+                        "title": title,
+                        "url": link,
+                        "description": summary,
+                        "published_at": self.parse_date(getattr(entry, 'published', None)),
+                        "author": getattr(entry, 'author', None),
+                    }
                     
-                    # IMPORTANT: NE PAS utiliser db.add() ici !
-                    # L'insertion se fait directement avec stmt ci-dessus
+                    articles.append(article_data)
                     
                 except Exception as e:
-                    print(f"[collector] insert fail {s['site_domain']} -> {e}", flush=True)
-                    traceback.print_exc()
-                    # Ne pas faire de rollback ici, continuer avec les autres articles
+                    logger.error(f"Error parsing RSS entry: {e}")
                     continue
-
-            await db.commit()
+            
+            logger.info(f"Parsed {len(articles)} articles from RSS for {source_url}")
+            return articles
+            
         except Exception as e:
-            print(f"[collector] source fail {s['site_domain']} -> {e}", flush=True)
-            traceback.print_exc()
-            try: 
-                await db.rollback()
-            except: 
-                pass
+            logger.error(f"RSS parsing failed for {source_url}: {e}")
+            return []
+    
+    def parse_date(self, date_str: Optional[str]) -> Optional[datetime]:
+        """✅ CORRIGÉ: Parse une date et normalise le timezone"""
+        if not date_str:
+            return self.normalize_datetime(datetime.now(timezone.utc))
+        
+        try:
+            from email.utils import parsedate_to_datetime
+            parsed_dt = parsedate_to_datetime(date_str)
+            return self.normalize_datetime(parsed_dt)
+        except:
+            try:
+                from dateutil.parser import parse
+                parsed_dt = parse(date_str)
+                return self.normalize_datetime(parsed_dt)
+            except:
+                return self.normalize_datetime(datetime.now(timezone.utc))
+    
+    def generate_content_hash(self, title: str, url: str) -> str:
+        """Génère un hash unique pour le contenu"""
+        content = f"{title}|{url}".encode('utf-8')
+        return hashlib.sha256(content).hexdigest()
+    
+    def normalize_url(self, url: str) -> str:
+        """Normalise une URL"""
+        try:
+            parsed = urlparse(url)
+            return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        except:
+            return url
+    
+    async def save_articles(self, db: AsyncSession, source: Source, articles: List[Dict[str, Any]]) -> int:
+        """✅ CORRIGÉ: Sauvegarde les articles avec datetime normalisés"""
+        saved_count = 0
+        
+        for article_data in articles:
+            try:
+                url = article_data["url"]
+                canonical_url = self.normalize_url(url)
+                domain = urlparse(url).netloc
+                content_hash = self.generate_content_hash(article_data["title"], canonical_url)
+                
+                # ✅ CORRECTION: Normaliser les datetime
+                published_at = self.normalize_datetime(article_data.get("published_at"))
+                fetched_at = self.normalize_datetime(datetime.now(timezone.utc))
+                
+                # Créer l'objet Article
+                article = Article(
+                    source_id=source.id,
+                    url=url,
+                    canonical_url=canonical_url,
+                    domain=domain,
+                    title=article_data["title"],
+                    summary_feed=article_data.get("description"),
+                    published_at=published_at,  # ✅ Datetime normalisé
+                    authors=[article_data["author"]] if article_data.get("author") else None,
+                    content_hash=content_hash,
+                    fetched_at=fetched_at,  # ✅ Datetime normalisé
+                    status="new"
+                )
+                
+                # UPSERT avec PostgreSQL
+                stmt = insert(Article).values(
+                    source_id=article.source_id,
+                    url=article.url,
+                    canonical_url=article.canonical_url,
+                    domain=article.domain,
+                    title=article.title,
+                    summary_feed=article.summary_feed,
+                    published_at=article.published_at,
+                    authors=article.authors,
+                    content_hash=article.content_hash,
+                    fetched_at=article.fetched_at,
+                    status=article.status
+                )
+                
+                stmt = stmt.on_conflict_do_update(
+                    index_elements=['canonical_url'],
+                    set_={
+                        'fetched_at': stmt.excluded.fetched_at,
+                        'status': stmt.excluded.status
+                    }
+                )
+                
+                await db.execute(stmt)
+                saved_count += 1
+                
+            except Exception as e:
+                logger.error(f"Error saving article {article_data.get('title', 'Unknown')}: {e}")
+                continue
+        
+        try:
+            await db.commit()
+            logger.info(f"Saved {saved_count} articles for source {source.name}")
+        except Exception as e:
+            await db.rollback()
+            logger.error(f"Error committing articles for source {source.name}: {e}")
+            return 0
+        
+        return saved_count
+    
+    async def process_source(self, db: AsyncSession, source: Source) -> Dict[str, Any]:
+        """Traite une source individuelle"""
+        try:
+            logger.info(f"Processing source {source.id}: {source.site_domain}")
+            
+            async with aiohttp.ClientSession() as session:
+                content = await self.fetch_feed_content(session, source.feed_url)
+                
+                if not content:
+                    logger.warning(f"No content retrieved for {source.feed_url}")
+                    return {"success": 0, "failed": 1, "articles": 0}
+                
+                articles_data = self.parse_rss_feed(content, source.feed_url)
+                
+                if not articles_data:
+                    logger.warning(f"No articles parsed for {source.feed_url}")
+                    return {"success": 1, "failed": 0, "articles": 0}
+                
+                saved_count = await self.save_articles(db, source, articles_data)
+                
+                logger.info(f"Source {source.name}: {saved_count} articles saved")
+                return {"success": 1, "failed": 0, "articles": saved_count}
+                
+        except Exception as e:
+            logger.error(f"Error processing source {source.id}: {e}")
+            return {"success": 0, "failed": 1, "articles": 0}
+
+# Instances et fonctions globales
+collector_service = CollectorService()
+
+async def run_collection_once(db: AsyncSession) -> Dict[str, Any]:
+    """Exécute un cycle de collecte complet"""
+    try:
+        logger.info("[collector] Starting collection cycle")
+        
+        stmt = select(Source).where(Source.active == True)
+        result = await db.execute(stmt)
+        sources = result.scalars().all()
+        
+        if not sources:
+            logger.warning("[collector] No active sources found")
+            return {"success": 0, "failed": 0, "articles": 0}
+        
+        logger.info(f"[collector] active sources: {len(sources)}")
+        
+        total_success = 0
+        total_failed = 0
+        total_articles = 0
+        
+        for source in sources:
+            try:
+                result = await collector_service.process_source(db, source)
+                total_success += result["success"]
+                total_failed += result["failed"]
+                total_articles += result["articles"]
+                
+                await asyncio.sleep(1)
+                
+            except Exception as e:
+                logger.error(f"[collector] Error processing source {source.id}: {e}")
+                total_failed += 1
+        
+        logger.info(f"[collector] Collection completed: {total_success} success, {total_failed} failed, {total_articles} articles total")
+        
+        return {
+            "success": total_success,
+            "failed": total_failed,
+            "articles": total_articles,
+            "timestamp": datetime.now(timezone.utc)  # ✅ CORRIGÉ: Avec timezone UTC
+        }
+        
+    except Exception as e:
+        logger.error(f"[collector] Collection cycle failed: {e}")
+        return {"success": 0, "failed": 1, "articles": 0, "error": str(e)}
+
+async def get_collection_health() -> Dict[str, Any]:
+    """Vérifie la santé de la collecte"""
+    try:
+        async for db in get_session():
+            result = await db.execute(text("""
+                SELECT 
+                    COUNT(*) as total_articles,
+                    COUNT(*) FILTER (WHERE fetched_at >= NOW() - INTERVAL '24 hours') as articles_24h,
+                    COUNT(*) FILTER (WHERE fetched_at >= NOW() - INTERVAL '1 hour') as articles_1h,
+                    MAX(fetched_at) as last_fetch
+                FROM articles
+            """))
+            
+            stats = result.fetchone()
+            
+            if stats[1] > 0:
+                status = "active"
+            elif stats[0] > 0:
+                status = "inactive"
+            else:
+                status = "empty"
+            
+            return {
+                "status": status,
+                "total_articles": stats[0],
+                "articles_24h": stats[1],
+                "articles_1h": stats[2],
+                "last_fetch": stats[3],
+                "timestamp": datetime.now(timezone.utc)  # ✅ CORRIGÉ
+            }
+            
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc)  # ✅ CORRIGÉ
+        }

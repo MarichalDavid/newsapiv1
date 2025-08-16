@@ -1,12 +1,44 @@
+# Dockerfile.api - Version corrigée pour votre structure
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y build-essential gcc libxml2-dev libxslt1-dev && rm -rf /var/lib/apt/lists/*
+# Variables d'environnement
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# Installer les dépendances système
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Créer le répertoire de travail
 WORKDIR /app
+
+# ✅ CORRECTION: Mise à jour pip d'abord
+RUN pip install --upgrade pip
+
+# Copier et installer les dépendances Python
 COPY requirements.txt /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY newsapi /app/
+# ✅ CORRECTION: Copier depuis la bonne structure
+COPY ./newsapi/app /app/app
+COPY ./config /app/config
+COPY ./newsapi/workers/run_collector.py /app/
+
+# Créer les répertoires nécessaires
+RUN mkdir -p /app/logs
+
+# Exposer le port
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Healthcheck
+HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Commande par défaut
+CMD ["python", "-m", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

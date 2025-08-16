@@ -1,0 +1,350 @@
+[
+  {
+    "name": "BBC News - World",
+    "url": "http://feeds.bbci.co.uk/news/world/rss.xml"
+  },
+  {
+    "name": "CNN - World",
+    "url": "http://rss.cnn.com/rss/edition_world.rss"
+  },
+  {
+    "name": "Al Jazeera - Top Stories",
+    "url": "https://www.aljazeera.com/xml/rss/all.xml"
+  },
+  {
+    "name": "New York Times - World",
+    "url": "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"
+  },
+  {
+    "name": "Google News - World",
+    "url": "https://news.google.com/rss?hl=en&gl=US&ceid=US:en"
+  },
+  {
+    "name": "Yahoo News - World",
+    "url": "https://www.yahoo.com/news/rss/world"
+  },
+  {
+    "name": "CNN - Business",
+    "url": "http://rss.cnn.com/rss/money_latest.rss"
+  },
+  {
+    "name": "Forbes - Business",
+    "url": "https://www.forbes.com/business/feed/"
+  },
+  {
+    "name": "TechCrunch",
+    "url": "http://feeds.feedburner.com/TechCrunch/"
+  },
+  {
+    "name": "The Verge",
+    "url": "https://www.theverge.com/rss/index.xml"
+  },
+  {
+    "name": "Wired",
+    "url": "https://www.wired.com/feed/rss"
+  },
+  {
+    "name": "Engadget",
+    "url": "https://www.engadget.com/rss.xml"
+  },
+  {
+    "name": "MIT Technology Review",
+    "url": "https://www.technologyreview.com/feed/"
+  },
+  {
+    "name": "ScienceDaily - Top News",
+    "url": "https://www.sciencedaily.com/rss/all.xml"
+  },
+  {
+    "name": "NASA - Breaking News",
+    "url": "https://www.nasa.gov/rss/dyn/breaking_news.rss"
+  },
+  {
+    "name": "RFI Afrique",
+    "url": "https://www.rfi.fr/fr/rss"
+  },
+  {
+    "name": "Morocco World News",
+    "url": "https://www.moroccoworldnews.com/feed"
+  },
+  {
+    "name": "Le Monde",
+    "url": "https://www.lemonde.fr/rss/une.xml"
+  },
+  {
+    "name": "France 24 - Monde",
+    "url": "https://www.france24.com/fr/rss"
+  },
+  {
+    "name": "Euronews",
+    "url": "https://www.euronews.com/rss?level=theme&name=news"
+  },
+  {
+    "name": "CoinDesk",
+    "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"
+  },
+  {
+    "name": "CoinTelegraph",
+    "url": "https://cointelegraph.com/rss"
+  },
+  {
+    "name": "CryptoSlate",
+    "url": "https://cryptoslate.com/feed/"
+  },
+  {
+    "name": "Investing.com - Forex",
+    "url": "https://www.investing.com/rss/news_25.rss"
+  },
+  {
+    "name": "IGN - Gaming",
+    "url": "https://feeds.ign.com/ign/games-all"
+  },
+  {
+    "name": "ESPN - Top Headlines",
+    "url": "https://www.espn.com/espn/rss/news"
+  },
+  {
+    "name": "Variety - Entertainment",
+    "url": "https://variety.com/feed/"
+  },
+  {
+    "name": "Rolling Stone",
+    "url": "https://www.rollingstone.com/feed/"
+  },
+  {
+    "name": "Wall Street Journal - World News",
+    "url": "https://feeds.a.dj.com/rss/RSSWorldNews.xml"
+  },
+  {
+    "name": "The Guardian - World News",
+    "url": "https://www.theguardian.com/world/rss"
+  },
+  {
+    "name": "Financial Times - World",
+    "url": "https://www.ft.com/world?format=rss"
+  },
+  {
+    "name": "Bloomberg Technology",
+    "url": "https://feeds.bloomberg.com/technology/news.rss"
+  },
+  {
+    "name": "Ars Technica",
+    "url": "http://feeds.arstechnica.com/arstechnica/index"
+  },
+  {
+    "name": "ZDNet",
+    "url": "https://www.zdnet.com/news/rss.xml"
+  },
+  {
+    "name": "TechNews",
+    "url": "https://technews.tw/feed/"
+  },
+  {
+    "name": "Hacker News",
+    "url": "https://hnrss.org/frontpage"
+  },
+  {
+    "name": "IEEE Spectrum",
+    "url": "https://spectrum.ieee.org/rss/fulltext"
+  },
+  {
+    "name": "Scientific American",
+    "url": "http://rss.sciam.com/ScientificAmerican-Global"
+  },
+  {
+    "name": "Nature Research News",
+    "url": "https://www.nature.com/nature.rss"
+  },
+  {
+    "name": "Space.com",
+    "url": "https://www.space.com/feeds/all"
+  },
+  {
+    "name": "Harvard Business Review",
+    "url": "http://feeds.harvardbusiness.org/harvardbusiness"
+  },
+  {
+    "name": "AllAfrica News",
+    "url": "https://allafrica.com/tools/headlines/rdf/latest/headlines.rdf"
+  },
+  {
+    "name": "Libération France",
+    "url": "https://www.liberation.fr/arc/outboundfeeds/rss-all/"
+  },
+  {
+    "name": "Le Figaro",
+    "url": "https://www.lefigaro.fr/rss/figaro_actualites.xml"
+  },
+  {
+    "name": "Deutsche Welle",
+    "url": "https://rss.dw.com/xml/rss-en-all"
+  },
+  {
+    "name": "Blockchain News",
+    "url": "https://blockchain.news/rss"
+  },
+  {
+    "name": "GameSpot",
+    "url": "https://www.gamespot.com/feeds/mashup/"
+  },
+  {
+    "name": "Polygon Gaming",
+    "url": "https://www.polygon.com/rss/index.xml"
+  },
+  {
+    "name": "Hollywood Reporter",
+    "url": "https://www.hollywoodreporter.com/feed/"
+  },
+  {
+    "name": "Deadline Entertainment",
+    "url": "https://deadline.com/feed/"
+  },
+  {
+    "name": "BBC Sport",
+    "url": "http://feeds.bbci.co.uk/sport/rss.xml"
+  },
+  {
+    "name": "Smithsonian Magazine",
+    "url": "https://www.smithsonianmag.com/rss/latest_articles/"
+  },
+  {
+    "name": "Fast Company",
+    "url": "https://www.fastcompany.com/latest/rss"
+  },
+  {
+    "name": "Inc. Magazine",
+    "url": "https://www.inc.com/rss/"
+  },
+  {
+    "name": "Entrepreneur",
+    "url": "https://www.entrepreneur.com/latest.rss"
+  },
+  {
+    "name": "MIT News",
+    "url": "https://news.mit.edu/rss/feed"
+  },
+  {
+    "name": "Stanford News",
+    "url": "https://news.stanford.edu/feed/"
+  },
+  {
+    "name": "TED Blog",
+    "url": "https://blog.ted.com/feed/"
+  },
+  {
+    "name": "BBC Africa",
+    "url": "http://feeds.bbci.co.uk/news/world/africa/rss.xml"
+  },
+  {
+    "name": "CryptoNews",
+    "url": "https://cryptonews.com/news/feed/"
+  },
+  {
+    "name": "Decrypt",
+    "url": "https://decrypt.co/feed"
+  },
+  {
+    "name": "The Block",
+    "url": "https://www.theblockcrypto.com/rss.xml"
+  },
+  {
+    "name": "PCGamer",
+    "url": "https://www.pcgamer.com/rss/"
+  },
+  {
+    "name": "Sky Sports",
+    "url": "http://www.skysports.com/rss/12040"
+  },
+  {
+    "name": "Phys.org - Earth News",
+    "url": "https://phys.org/rss-feed/earth-news/"
+  },
+  {
+    "name": "Popular Science",
+    "url": "https://www.popsci.com/rss/"
+  },
+  {
+    "name": "Business Insider",
+    "url": "https://feeds.businessinsider.com/custom/all"
+  },
+  {
+    "name": "Fortune",
+    "url": "https://fortune.com/feed/"
+  },
+  {
+    "name": "MarketWatch",
+    "url": "http://feeds.marketwatch.com/marketwatch/topstories/"
+  },
+  {
+    "name": "Quartz",
+    "url": "https://qz.com/feed/"
+  },
+  {
+    "name": "New Scientist",
+    "url": "https://www.newscientist.com/feed/home/"
+  },
+  {
+    "name": "NPR Technology",
+    "url": "https://feeds.npr.org/1019/rss.xml"
+  },
+  {
+    "name": "BBC Technology",
+    "url": "http://feeds.bbci.co.uk/news/technology/rss.xml"
+  },
+  {
+    "name": "The Next Web",
+    "url": "https://thenextweb.com/feed/"
+  },
+  {
+    "name": "VentureBeat",
+    "url": "https://venturebeat.com/feed/"
+  },
+  {
+    "name": "TechRadar",
+    "url": "https://www.techradar.com/rss"
+  },
+  {
+    "name": "CNET",
+    "url": "https://www.cnet.com/rss/news/"
+  },
+  {
+    "name": "9to5Mac",
+    "url": "https://9to5mac.com/feed/"
+  },
+  {
+    "name": "Android Authority",
+    "url": "https://www.androidauthority.com/feed/"
+  },
+  {
+    "name": "BBC Business",
+    "url": "http://feeds.bbci.co.uk/news/business/rss.xml"
+  },
+  {
+    "name": "CNBC Technology",
+    "url": "https://www.cnbc.com/id/19854910/device/rss/rss.html"
+  },
+  {
+    "name": "TIME",
+    "url": "https://feeds.feedburner.com/time/topstories"
+  },
+  {
+    "name": "Newsweek",
+    "url": "https://www.newsweek.com/rss"
+  },
+  {
+    "name": "The Hill",
+    "url": "https://thehill.com/feed/"
+  },
+  {
+    "name": "Axios",
+    "url": "https://api.axios.com/feed/"
+  },
+  {
+    "name": "Game Informer",
+    "url": "https://www.gameinformer.com/rss.xml"
+  },
+  {
+    "name": "Medical Xpress",
+    "url": "https://medicalxpress.com/rss-feed/"
+  }
+]

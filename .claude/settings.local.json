@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker-compose exec:*)",
+      "Bash(curl:*)",
+      "Bash(docker-compose restart:*)",
+      "Bash(docker-compose logs:*)",
+      "Bash(docker-compose:*)",
+      "Bash(python:*)",
+      "Bash(grep:*)",
+      "Bash(timeout:*)",
+      "Bash(docker cp:*)",
+      "Bash(ls:*)"
+    ],
+    "defaultMode": "acceptEdits"
+  }
+}

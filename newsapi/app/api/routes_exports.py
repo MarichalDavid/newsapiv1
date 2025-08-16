@@ -4,6 +4,7 @@ from ..core.db import get_session
 from ..core.schemas import Filters
 from ..services.queries import list_articles
 from sqlalchemy import text
+from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/exports", tags=["exports"])
 
@@ -57,20 +58,30 @@ async def export_sentiment_csv(
     db: AsyncSession = Depends(get_session)
 ):
     """Export CSV des données de sentiment"""
-    # ✅ CORRECTION : Convertir en string pour la concaténation PostgreSQL
+    since_dt = datetime.utcnow() - timedelta(days=days)
+    
+    # Query actual articles table for sentiment data
     sql = text("""
-        SELECT d, domain, pos_count, neu_count, neg_count
-        FROM source_sentiment_daily
-        WHERE d >= NOW() - (:days || ' days')::interval
-        ORDER BY d DESC, domain
+        SELECT 
+            DATE(published_at) as date,
+            domain,
+            COUNT(*) as total_articles,
+            COUNT(*) FILTER (WHERE sentiment_score > 0.1) as positive,
+            COUNT(*) FILTER (WHERE sentiment_score BETWEEN -0.1 AND 0.1) as neutral,
+            COUNT(*) FILTER (WHERE sentiment_score < -0.1) as negative,
+            AVG(sentiment_score) as avg_sentiment
+        FROM articles
+        WHERE published_at >= :since_dt
+        AND sentiment_score IS NOT NULL
+        GROUP BY DATE(published_at), domain
+        ORDER BY date DESC, domain
     """)
     
-    # ✅ CORRECTION : Convertir l'entier en string pour la concaténation
-    rows = (await db.execute(sql, {"days": str(days)})).mappings().all()
+    rows = (await db.execute(sql, {"since_dt": since_dt})).mappings().all()
     
-    csv_rows = ["date,domain,positive,neutral,negative"]
+    csv_rows = ["date,domain,total_articles,positive,neutral,negative,avg_sentiment"]
     for r in rows:
-        csv_rows.append(f"{r['d']},{r['domain']},{r['pos_count']},{r['neu_count']},{r['neg_count']}")
+        csv_rows.append(f"{r['date']},{r['domain']},{r['total_articles']},{r['positive']},{r['neutral']},{r['negative']},{r['avg_sentiment']:.3f}")
     
     return Response(content="\n".join(csv_rows), media_type="text/csv")
 
@@ -91,7 +102,6 @@ async def export_topics_json(db: AsyncSession = Depends(get_session)):
 @router.get("/stats.json")
 async def export_stats_json(db: AsyncSession = Depends(get_session)):
     """Export JSON des statistiques"""
-    # Réutiliser la logique de routes_stats.py
     sql = text("""
         SELECT 
             COUNT(*) as total_articles,

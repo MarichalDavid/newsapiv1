@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from ..core.db import get_session
+from datetime import datetime, timedelta
 
 router = APIRouter(prefix="/clusters", tags=["clusters"])
 
@@ -11,12 +12,14 @@ async def list_clusters(
     limit_clusters: int = Query(100, ge=1, le=1000),
     db: AsyncSession = Depends(get_session)
 ):
-    # ✅ CORRECTION : Utiliser la concaténation PostgreSQL pour INTERVAL
+    # ✅ CORRECTION: Calculer la date côté Python
+    since_dt = datetime.utcnow() - timedelta(hours=since_hours)
+    
     sql = text("""
         WITH recent AS (
           SELECT cluster_id, count(*) AS n, max(published_at) AS last_pub
           FROM articles
-          WHERE fetched_at >= NOW() - (:since_hours || ' hours')::interval
+          WHERE fetched_at >= :since_dt
             AND cluster_id IS NOT NULL
           GROUP BY cluster_id
         )
@@ -25,13 +28,12 @@ async def list_clusters(
         LIMIT :limit_clusters
     """)
     
-    # ✅ CORRECTION : Convertir since_hours en string pour la concaténation
     res = await db.execute(sql, {
-        "since_hours": str(since_hours), 
+        "since_dt": since_dt,
         "limit_clusters": limit_clusters
     })
     
-    # ✅ CORRECTION : Utiliser .mappings() pour dict conversion
+    # ✅ CORRECTION: Utiliser .mappings() correctement
     return [dict(r) for r in res.mappings()]
 
 @router.get("/{cluster_id}/articles")
@@ -42,7 +44,7 @@ async def articles_in_cluster(
     db: AsyncSession = Depends(get_session)
 ):
     sql = text("""
-        SELECT id, title, canonical_url, domain, published_at, lang, keywords, topics, summary_final, summary_source
+        SELECT id, title, url, canonical_url, domain, published_at, lang, keywords, topics, summary_final, summary_source
         FROM articles
         WHERE cluster_id = :cid
         ORDER BY published_at DESC NULLS LAST
@@ -55,7 +57,7 @@ async def articles_in_cluster(
         "offset": offset
     })
     
-    # ✅ CORRECTION : Utiliser .mappings() pour dict conversion
+    # ✅ CORRECTION: Utiliser .mappings() correctement
     return [dict(r) for r in res.mappings()]
 
 @router.get("/{cluster_id}")

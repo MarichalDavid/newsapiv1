@@ -1,3 +1,14 @@
+-- Create user and database if they don't exist
+DO $$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'news') THEN
+    CREATE USER news WITH PASSWORD 'news';
+  END IF;
+END
+$$;
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
 -- Tables
 CREATE TABLE IF NOT EXISTS sources (
   id SERIAL PRIMARY KEY,

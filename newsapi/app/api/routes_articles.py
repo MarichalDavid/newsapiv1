@@ -55,7 +55,6 @@ async def get_articles(
             detail="Erreur interne du serveur"
         )
 
-
 @router.get("/{id}", response_model=ArticleDetail)
 async def get_article_by_id(id: int, db: AsyncSession = Depends(get_session)):
     art = await get_article(db, id)
@@ -63,8 +62,8 @@ async def get_article_by_id(id: int, db: AsyncSession = Depends(get_session)):
         raise HTTPException(404, "Article not found")
     return art
 
-# ✅ CORRECTION: Un seul endpoint /search avec paramètre obligatoire
-@router.get("/search")
+# 🔧 CORRECTION: Endpoint de recherche corrigé - retiré de sous-route "/articles/search"
+@router.get("/search", response_model=dict)
 async def search_articles_in_articles(
     q: str = Query(..., description="Requête de recherche obligatoire"),
     limit: int = Query(20, ge=1, le=100),

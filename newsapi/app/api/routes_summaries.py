@@ -16,7 +16,7 @@ router = APIRouter(prefix="/summaries", tags=["summaries"])
 @router.get("")
 async def list_or_regen_summaries(
     since_hours: int = Query(24, ge=1, le=24*14),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(10, ge=1, le=50),  # Reduced limit for faster processing
     offset: int = Query(0, ge=0),
     lang: Optional[str] = Query(None, description="Langue de sortie (ex: 'fr' ou 'en')"),
     regen: bool = Query(False, description="Régénérer les résumés manquants/forcés via LLM"),
@@ -48,6 +48,10 @@ async def list_or_regen_summaries(
     out = []
     touched = False
 
+    # Limit LLM processing to prevent timeouts
+    llm_processed = 0
+    max_llm_calls = 5  # Limit concurrent LLM calls
+    
     for a in articles:
         final = a.summary_final
         source = a.summary_source
@@ -55,12 +59,17 @@ async def list_or_regen_summaries(
 
         if regen or not final:
             final, source, _ = choose_summary(a.summary_feed, a.full_text)
-            if not final:
+            if not final and llm_processed < max_llm_calls:
                 raw = a.full_text or a.summary_feed or a.title or ""
-                llm_text = await llm_summarize(raw, lang=lang or a.lang or "fr", max_words=180)
+                llm_text = await llm_summarize(raw, lang=lang or a.lang or "fr", max_words=120)  # Reduced tokens
                 final = llm_text
                 source = "llm"
                 llm    = llm_text
+                llm_processed += 1
+            elif not final:
+                # Fallback without LLM for remaining items
+                final = (a.summary_feed or a.title or "No summary available")[:200]
+                source = "fallback"
 
             if persist:
                 a.summary_final = final
@@ -105,7 +114,7 @@ async def general_summary(
         select(Article)
         .where(Article.published_at >= since_dt)
         .order_by(desc(Article.published_at))
-        .limit(50)  # Limiter pour éviter les timeouts
+        .limit(20)  # Reduced for faster processing with Qwen2.5:3B
     )
     
     result = await db.execute(stmt)
@@ -265,50 +274,57 @@ async def trending_topics_summary(
     lang: str = Query("fr"),
     db: AsyncSession = Depends(get_session)
 ):
-    """Synthèse des topics en tendance"""
+    """Synthèse des topics en tendance (fallback sur keywords si topics[] vide)"""
     from sqlalchemy import text
-    
+    from datetime import datetime, timedelta
+
     since_dt = datetime.utcnow() - timedelta(hours=since_hours)
-    
-    # Trouver les topics les plus populaires
+
     sql = text("""
-        SELECT unnest(topics) AS topic, COUNT(*) AS article_count
-        FROM articles
-        WHERE published_at >= :since_dt
-          AND topics IS NOT NULL
+        WITH base AS (
+            -- 1) topics[] quand présent
+            SELECT unnest(topics) AS topic
+            FROM articles
+            WHERE published_at >= :since_dt
+              AND topics IS NOT NULL AND array_length(topics,1) > 0
+            UNION ALL
+            -- 2) fallback sur keywords[] quand topics[] absent/vide
+            SELECT unnest(keywords) AS topic
+            FROM articles
+            WHERE published_at >= :since_dt
+              AND (topics IS NULL OR array_length(topics,1) = 0)
+              AND keywords IS NOT NULL AND array_length(keywords,1) > 0
+        )
+        SELECT topic, COUNT(*) AS article_count
+        FROM base
         GROUP BY topic
         HAVING COUNT(*) >= :min_articles
         ORDER BY article_count DESC
         LIMIT :limit_topics
     """)
-    
-    result = await db.execute(sql, {
+
+    params = {
         "since_dt": since_dt,
         "min_articles": min_articles,
         "limit_topics": limit_topics
-    })
-    
-    trending_topics = result.mappings().all()
-    
-    if not trending_topics:
-        raise HTTPException(404, "Aucun topic en tendance trouvé")
-    
-    topics_summary = []
-    for topic_row in trending_topics:
-        topic_name = topic_row['topic']
-        article_count = topic_row['article_count']
-        
-        topics_summary.append({
-            "topic": topic_name,
-            "article_count": article_count,
-            "trend_score": article_count / since_hours  # Articles par heure
-        })
-    
+    }
+    result = await db.execute(sql, params)
+    rows = result.mappings().all()
+
+    topics_summary = [
+        {
+            "topic": r["topic"],
+            "article_count": r["article_count"],
+            "trend_score": r["article_count"] / max(1, since_hours)  # articles/heure
+        }
+        for r in rows
+    ]
+
+    # ✅ Ne JAMAIS lever un 404 ici : renvoyer 200 + liste vide
     return {
         "trending_topics": topics_summary,
         "period_hours": since_hours,
         "total_trending_topics": len(topics_summary),
+        "language": lang,
         "generated_at": datetime.utcnow(),
-        "summary": f"Les topics les plus discutés des dernières {since_hours}h sont : " + 
-                  ", ".join([t['topic'] for t in topics_summary[:5]])
     }

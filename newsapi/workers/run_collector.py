@@ -1,156 +1,235 @@
+# newsapi/workers/run_collector.py - Worker principal corrigé
+
 import asyncio
+import logging
+import signal
+import sys
 import os
-from app.core.db import get_session
-from app.services.collector import run_collection_once
-from sqlalchemy import text
-from app.services.topics_bertopic import build_and_assign as build_topics
-from app.services.sentiment_simple import label_text
-from app.services.facts import extract_facts
+from datetime import datetime
+from pathlib import Path
 
-# ✅ NOUVEAU: Configuration via variables d'environnement
-# Utiliser votre variable existante en priorité, sinon fallback sur la nouvelle
-COLLECTION_INTERVAL_MINUTES = int(os.getenv("COLLECTOR_DEFAULT_FREQUENCY_MIN", 
-                                           os.getenv("COLLECTION_INTERVAL_MINUTES", "30")))
-ENABLE_AUTO_COLLECTION = os.getenv("ENABLE_AUTO_COLLECTION", "true").lower() == "true"
-ENABLE_TOPICS_REFRESH = os.getenv("ENABLE_TOPICS_REFRESH", "true").lower() == "true"
-ENABLE_SENTIMENT_AGG = os.getenv("ENABLE_SENTIMENT_AGG", "true").lower() == "true"
+# ✅ CORRECTION: Ajouter le répertoire parent au PYTHONPATH
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-print(f"🔧 Configuration Worker:")
-print(f"   - Collecte auto: {'ON' if ENABLE_AUTO_COLLECTION else 'OFF'}")
-print(f"   - Intervalle: {COLLECTION_INTERVAL_MINUTES} minutes")
-print(f"   - Topics BERTopic: {'ON' if ENABLE_TOPICS_REFRESH else 'OFF'}")
-print(f"   - Agrégation sentiment: {'ON' if ENABLE_SENTIMENT_AGG else 'OFF'}")
+# ✅ CORRECTION: Import avec gestion d'erreur améliorée
+try:
+    from app.services.collector import run_collection_once, get_collection_health
+    from app.core.db import SessionLocal
+except ImportError as e:
+    print(f"❌ Import error: {e}")
+    print("Current working directory:", os.getcwd())
+    print("Python path:", sys.path)
+    print("Make sure you're running from the correct directory")
+    sys.exit(1)
 
-async def _aggregate_sentiment(session):
-    """Agrégation des sentiments par source et date"""
-    if not ENABLE_SENTIMENT_AGG:
-        return
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('/app/logs/collector.log') if os.path.exists('/app/logs') else logging.NullHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class CollectorWorker:
+    """Worker principal pour la collecte d'articles"""
+    
+    def __init__(self):
+        self.running = False
+        self.collection_interval = int(os.getenv("COLLECTION_INTERVAL_MINUTES", "30")) * 60
+        self.enable_auto_collection = os.getenv("ENABLE_AUTO_COLLECTION", "true").lower() == "true"
+        self.max_retries = int(os.getenv("WORKER_RETRY_ATTEMPTS", "3"))
         
-    try:
-        await session.execute(text("""
-            INSERT INTO source_sentiment_daily(d, domain, pos_count, neu_count, neg_count)
-            SELECT current_date, domain,
-                SUM((COALESCE(sentiment_label,'neu')='pos')::int),
-                SUM((COALESCE(sentiment_label,'neu')='neu')::int),
-                SUM((COALESCE(sentiment_label,'neu')='neg')::int)
-            FROM articles
-            WHERE published_at >= current_date
-            GROUP BY domain
-            ON CONFLICT (d, domain) DO UPDATE SET
-                pos_count=EXCLUDED.pos_count, neu_count=EXCLUDED.neu_count, neg_count=EXCLUDED.neg_count
-        """))
-        await session.commit()
-        print("✅ Agrégation sentiment terminée")
-    except Exception as e:
-        print(f"❌ Erreur agrégation sentiment: {e}")
-
-async def _refresh_mv(session):
-    """Rafraîchissement des vues matérialisées"""
-    try:
-        await session.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY mv_topics_daily"))
-        await session.commit()
-        print("✅ Vue matérialisée rafraîchie (CONCURRENTLY)")
-    except Exception:
+    async def setup_signal_handlers(self):
+        """Configure les gestionnaires de signaux pour arrêt propre"""
+        def signal_handler(signum, frame):
+            logger.info(f"Signal {signum} reçu, arrêt du worker...")
+            self.running = False
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+    
+    async def run_collection_cycle(self):
+        """Exécute un cycle de collecte avec gestion d'erreur robuste"""
+        retry_count = 0
+        
+        while retry_count < self.max_retries:
+            try:
+                logger.info(f"🔄 Début du cycle de collecte (tentative {retry_count + 1}/{self.max_retries})")
+                
+                # ✅ CORRECTION: Gérer la session de base de données proprement
+                async with SessionLocal() as session:
+                    result = await run_collection_once(session)
+                    
+                    if result.get("articles", 0) > 0:
+                        logger.info(f"✅ Collecte réussie: {result['articles']} articles")
+                    else:
+                        logger.warning("⚠️ Aucun article collecté")
+                
+                logger.info("✅ Cycle de collecte terminé avec succès")
+                return True
+                
+            except Exception as e:
+                retry_count += 1
+                logger.error(f"❌ Erreur lors de la collecte (tentative {retry_count}/{self.max_retries}): {e}")
+                
+                if retry_count < self.max_retries:
+                    wait_time = min(60 * retry_count, 300)
+                    logger.info(f"⏳ Attente de {wait_time}s avant nouvelle tentative...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error("❌ Échec de toutes les tentatives de collecte")
+                    return False
+        
+        return False
+    
+    async def health_check(self):
+        """Vérification de santé du système"""
         try:
-            await session.execute(text("REFRESH MATERIALIZED VIEW mv_topics_daily"))
-            await session.commit()
-            print("✅ Vue matérialisée rafraîchie")
+            health = await get_collection_health()
+            logger.info(f"📊 Santé système: {health['status']} - {health.get('total_articles', 0)} articles")
+            return health
         except Exception as e:
-            print(f"❌ Erreur rafraîchissement vue: {e}")
+            logger.error(f"❌ Erreur health check: {e}")
+            return {"status": "error", "error": str(e)}
+    
+    async def diagnose_sources(self):
+        """Diagnostic des sources disponibles"""
+        try:
+            async with SessionLocal() as session:
+                from sqlalchemy import text
+                
+                # Compter les sources
+                result = await session.execute(text("""
+                    SELECT 
+                        COUNT(*) as total,
+                        COUNT(*) FILTER (WHERE active = true) as active,
+                        COUNT(*) FILTER (WHERE active = false) as inactive
+                    FROM sources
+                """))
+                stats = result.fetchone()
+                
+                logger.info(f"📊 Sources: {stats[1]} actives / {stats[0]} total")
+                
+                if stats[1] == 0:
+                    logger.warning("⚠️ AUCUNE SOURCE ACTIVE!")
+                    
+                    # Lister quelques sources pour diagnostic
+                    result = await session.execute(text("""
+                        SELECT id, name, feed_url, active 
+                        FROM sources 
+                        ORDER BY id 
+                        LIMIT 5
+                    """))
+                    sample_sources = result.fetchall()
+                    
+                    logger.info("📋 Échantillon de sources:")
+                    for source in sample_sources:
+                        status = "✅" if source[3] else "❌"
+                        logger.info(f"  {status} [{source[0]}] {source[1]} -> {source[2]}")
+                
+                return {
+                    "total": stats[0],
+                    "active": stats[1],
+                    "inactive": stats[2]
+                }
+                
+        except Exception as e:
+            logger.error(f"❌ Erreur diagnostic sources: {e}")
+            return {"error": str(e)}
+    
+    async def start(self):
+        """Démarre le worker principal"""
+        logger.info("🚀 Démarrage du CollectorWorker")
+        logger.info(f"📅 Intervalle de collecte: {self.collection_interval/60:.1f} minutes")
+        logger.info(f"🔄 Collecte automatique: {'activée' if self.enable_auto_collection else 'désactivée'}")
+        
+        await self.setup_signal_handlers()
+        self.running = True
+        
+        # Diagnostic initial
+        await self.diagnose_sources()
+        
+        # Health check initial
+        await self.health_check()
+        
+        # Première collecte immédiate si activée
+        if self.enable_auto_collection:
+            logger.info("🎯 Exécution de la collecte initiale...")
+            await self.run_collection_cycle()
+        
+        # Boucle principale
+        last_collection = datetime.now()
+        
+        while self.running:
+            try:
+                await asyncio.sleep(10)
+                
+                if not self.running:
+                    break
+                
+                now = datetime.now()
+                time_since_last = (now - last_collection).total_seconds()
+                
+                # Collecte automatique
+                if self.enable_auto_collection and time_since_last >= self.collection_interval:
+                    logger.info("⏰ Heure de collecte automatique")
+                    success = await self.run_collection_cycle()
+                    
+                    if success:
+                        last_collection = now
+                    else:
+                        # Attendre un peu plus en cas d'échec
+                        await asyncio.sleep(300)
+                
+                # Health check périodique (toutes les heures)
+                if time_since_last % 3600 < 10:
+                    await self.health_check()
+                    
+            except asyncio.CancelledError:
+                logger.info("🛑 Worker annulé")
+                break
+            except Exception as e:
+                logger.error(f"❌ Erreur dans la boucle principale: {e}")
+                await asyncio.sleep(30)
+        
+        logger.info("🏁 CollectorWorker arrêté")
 
 async def main():
-    """Boucle principale du worker avec configuration flexible"""
-    
-    if not ENABLE_AUTO_COLLECTION:
-        print("❌ Collecte automatique désactivée (ENABLE_AUTO_COLLECTION=false)")
-        print("   Le worker s'arrête. Utilisez l'endpoint /api/v1/admin/collect pour des collectes manuelles.")
-        return
-    
-    print(f"🚀 Démarrage du worker de collecte (intervalle: {COLLECTION_INTERVAL_MINUTES}min)")
-    
-    # Compteurs pour les tâches périodiques
-    topics_refresh_counter = 0
-    mv_refresh_counter = 0
-    agg_counter = 0
-    
-    # Calcul des intervalles basés sur votre configuration existante
+    """Point d'entrée principal du worker"""
     try:
-        from app.core.config import settings
-        base_freq = getattr(settings, 'DEFAULT_FREQ_MIN', COLLECTION_INTERVAL_MINUTES)
-    except:
-        base_freq = COLLECTION_INTERVAL_MINUTES  # Fallback
-    
-    # Intervalles pour les tâches (en cycles de collecte)
-    topics_interval = max(1, (6*60) // base_freq)     # Topics toutes les 6h
-    mv_interval = max(1, (30) // base_freq)           # MV toutes les 30min  
-    agg_interval = max(1, (10) // base_freq)          # Sentiment toutes les 10min
-    
-    while True:
-        cycle_start = asyncio.get_event_loop().time()
+        # Vérifier l'environnement
+        logger.info("🔍 Vérification de l'environnement...")
         
-        # 1. Collecte principale (toujours)
-        async for session in get_session():
-            try:
-                print(f"📥 Début cycle de collecte (intervalle: {COLLECTION_INTERVAL_MINUTES}min)")
-                await run_collection_once(session)
-                print("✅ Collecte terminée")
-            except Exception as e:
-                print(f"❌ Erreur collecte: {e}", flush=True)
-            break
+        # Vérifier la connexion à la base de données
+        try:
+            async with SessionLocal() as session:
+                from sqlalchemy import text
+                result = await session.execute(text("SELECT 1"))
+                logger.info("✅ Connexion base de données OK")
+        except Exception as e:
+            logger.error(f"❌ Erreur connexion base de données: {e}")
+            sys.exit(1)
         
-        # 2. Tâches périodiques
-        topics_refresh_counter += 1
-        mv_refresh_counter += 1  
-        agg_counter += 1
+        # Démarrer le worker
+        worker = CollectorWorker()
+        await worker.start()
         
-        # Topics BERTopic (toutes les 6h par défaut)
-        if ENABLE_TOPICS_REFRESH and topics_refresh_counter >= topics_interval:
-            try:
-                print("🧠 Mise à jour des topics BERTopic...")
-                async for s in get_session():
-                    await build_topics(s)
-                    break
-                print("✅ Topics BERTopic mis à jour")
-            except Exception as e:
-                print(f'❌ Erreur topics: {e}')
-            topics_refresh_counter = 0
-        
-        # Vue matérialisée (toutes les 30min par défaut)
-        if mv_refresh_counter >= mv_interval:
-            try:
-                async for s in get_session():
-                    await _refresh_mv(s)
-                    break
-            except Exception as e:
-                print(f'❌ Erreur MV refresh: {e}')
-            mv_refresh_counter = 0
-        
-        # Agrégation sentiment (toutes les 10min par défaut)
-        if agg_counter >= agg_interval:
-            try:
-                async for s in get_session():
-                    await _aggregate_sentiment(s)
-                    break
-            except Exception as e:
-                print(f'❌ Erreur agrégation: {e}')
-            agg_counter = 0
-        
-        # 3. Attente jusqu'au prochain cycle
-        cycle_duration = asyncio.get_event_loop().time() - cycle_start
-        sleep_time = max(0, (COLLECTION_INTERVAL_MINUTES * 60) - cycle_duration)
-        
-        if sleep_time > 0:
-            print(f"⏰ Prochain cycle dans {sleep_time/60:.1f} minutes")
-            await asyncio.sleep(sleep_time)
-        else:
-            print("⚠️  Cycle plus long que l'intervalle configuré")
+    except KeyboardInterrupt:
+        logger.info("🛑 Interruption clavier reçue")
+    except Exception as e:
+        logger.error(f"❌ Erreur fatale du worker: {e}")
+        sys.exit(1)
+    finally:
+        logger.info("👋 Arrêt du worker")
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("🛑 Worker arrêté par l'utilisateur")
+        print("\n🛑 Arrêt demandé par l'utilisateur")
     except Exception as e:
-        print(f"💥 Erreur fatale worker: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Erreur fatale: {e}")
+        sys.exit(1)

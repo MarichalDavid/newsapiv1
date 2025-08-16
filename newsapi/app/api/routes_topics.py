@@ -7,29 +7,40 @@ router = APIRouter(prefix="/topics", tags=["topics"])
 
 @router.get("")
 async def list_topics(db: AsyncSession = Depends(get_session)):
+    # 1) topics[] si présent
+    # 2) sinon fallback sur keywords[]
     sql = text("""
-        SELECT unnest(topics) AS topic, COUNT(*) AS count
-        FROM articles
-        WHERE topics IS NOT NULL
+        WITH base AS (
+            SELECT unnest(topics) AS topic
+            FROM articles
+            WHERE topics IS NOT NULL AND array_length(topics,1) > 0
+            UNION ALL
+            SELECT unnest(keywords) AS topic
+            FROM articles
+            WHERE (topics IS NULL OR array_length(topics,1) = 0)
+              AND keywords IS NOT NULL AND array_length(keywords,1) > 0
+        )
+        SELECT topic, COUNT(*) AS count
+        FROM base
         GROUP BY topic
         ORDER BY count DESC
-        LIMIT 200;
+        LIMIT 100
     """)
-    res = await db.execute(sql)
-    rows = res.mappings().all()
-    return rows
+    rows = (await db.execute(sql)).mappings().all()
+    return [dict(r) for r in rows]
 
 @router.get("/{topic}/articles")
 async def articles_by_topic(topic: str, limit: int = 50, offset: int = 0, db: AsyncSession = Depends(get_session)):
     sql = text("""
-        SELECT id, title, canonical_url, domain, published_at, lang, keywords, topics, summary_final, summary_source
+        SELECT id, title, url, canonical_url, domain, published_at, lang, keywords, topics, summary_final, summary_source
         FROM articles
-        WHERE topics @> ARRAY[:topic]
+        WHERE topics && ARRAY[:topic]
         ORDER BY published_at DESC NULLS LAST
         LIMIT :limit OFFSET :offset
     """)
     res = await db.execute(sql, {"topic": topic, "limit": limit, "offset": offset})
-    return [dict(r) for r in res]
+    rows = res.mappings().all()
+    return [dict(r) for r in rows]
 
 @router.get("/{topic_name}")
 async def get_topic_details(

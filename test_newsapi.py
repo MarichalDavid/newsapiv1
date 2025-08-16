@@ -1,662 +1,853 @@
 #!/usr/bin/env python3
 """
-Script de Test Complet pour MarichalDavid/newsapi
-Teste tous les endpoints principaux et secondaires avec rapport détaillé
+Script de test complet pour l'API NewsAI avec validation du contenu
+Tests TOUS les endpoints + validation de la structure et du contenu des réponses
+
+Usage:
+    python test_newsapi_complete.py --base-url http://localhost:8000
+    python test_newsapi_complete.py --base-url https://your-api.com --verbose
+    python test_newsapi_complete.py --only health,articles --timeout 30
 """
 
-import requests
+import asyncio
+import aiohttp
+import argparse
 import json
-import time
 import sys
 from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Optional, Any, Union
 from dataclasses import dataclass
-from urllib.parse import quote
-import csv
-import io
-from pathlib import Path
+from enum import Enum
+import traceback
+import time
+import re
 
-# Configuration
-BASE_URL = "http://localhost:8000"
-TIMEOUT = 30
-RETRY_COUNT = 2
-RETRY_DELAY = 2
+class TestStatus(Enum):
+    PASS = "[PASS] PASS"
+    FAIL = "[FAIL] FAIL"
+    SKIP = "[SKIP] SKIP"
+    WARN = "[WARN] WARN"
+    CONTENT_FAIL = "[CONTENT_FAIL] CONTENT FAIL"
+    EMPTY_RESPONSE = "[EMPTY_RESPONSE] EMPTY RESPONSE"  # Nouvelle catégorie pour les réponses vides
 
 @dataclass
 class TestResult:
-    """Résultat d'un test d'endpoint"""
     endpoint: str
     method: str
-    status_code: Optional[int]
-    success: bool
+    status_code: int
     response_time: float
-    error_message: Optional[str]
-    response_data: Optional[Any]
-    headers: Optional[Dict]
-    test_description: str
+    status: TestStatus
+    message: str
+    response_data: Optional[Any] = None  # Utiliser Any pour stocker n'importe quel type de réponse
+    content_checks: List[str] = None
 
-class NewsAPITester:
-    """Testeur complet pour l'API NewsAPI"""
+class ContentValidator:
+    """Classe pour valider le contenu des réponses API"""
     
-    def __init__(self, base_url: str = BASE_URL):
+    @staticmethod
+    def validate_article(article: Dict) -> List[str]:
+        """Valide la structure d'un article"""
+        errors = []
+        required_fields = ['id', 'title', 'url', 'domain']
+        
+        for field in required_fields:
+            if field not in article:
+                errors.append(f"Champ manquant: {field}")
+            elif not article[field]:
+                errors.append(f"Champ vide: {field}")
+        
+        # Validation des types
+        if 'id' in article and not isinstance(article['id'], int):
+            errors.append("ID doit être un entier")
+        
+        if 'title' in article and len(str(article['title'])) < 3:
+            errors.append("Titre trop court")
+        
+        if 'url' in article and not str(article['url']).startswith(('http://', 'https://')):
+            errors.append("URL invalide")
+        
+        return errors
+
+    @staticmethod
+    def validate_source(source: Dict) -> List[str]:
+        """Valide la structure d'une source"""
+        errors = []
+        required_fields = ['id', 'name', 'feed_url', 'site_domain', 'active']
+        
+        for field in required_fields:
+            if field not in source:
+                errors.append(f"Champ manquant: {field}")
+        
+        if 'active' in source and not isinstance(source['active'], bool):
+            errors.append("'active' doit être un booléen")
+        
+        if 'feed_url' in source and not str(source['feed_url']).startswith(('http://', 'https://')):
+            errors.append("feed_url invalide")
+        
+        return errors
+
+    @staticmethod
+    def validate_stats(stats: Dict) -> List[str]:
+        """Valide les statistiques générales"""
+        errors = []
+        required_fields = ['total_articles', 'unique_domains']
+        numeric_fields = ['total_articles', 'unique_domains', 'articles_24h']
+        
+        for field in required_fields:
+            if field not in stats:
+                errors.append(f"Champ statistique manquant: {field}")
+        
+        for field in numeric_fields:
+            if field in stats and not isinstance(stats[field], (int, float)):
+                errors.append(f"{field} doit être numérique")
+            elif field in stats and stats[field] < 0:
+                errors.append(f"{field} ne peut pas être négatif")
+        
+        return errors
+
+    @staticmethod
+    def validate_health(health: Dict) -> List[str]:
+        """Valide la réponse health"""
+        errors = []
+        
+        if 'status' not in health:
+            errors.append("Champ 'status' manquant")
+        elif health['status'] not in ['ok', 'healthy', 'running']:
+            errors.append(f"Status invalide: {health['status']}")
+        
+        return errors
+
+    @staticmethod
+    def validate_cluster(cluster: Dict) -> List[str]:
+        """Valide la structure d'un cluster"""
+        errors = []
+        
+        if 'cluster_id' not in cluster:
+            errors.append("cluster_id manquant")
+        
+        if 'n' in cluster and not isinstance(cluster['n'], int):
+            errors.append("'n' doit être un entier")
+        
+        return errors
+
+class NewsAIAPITester:
+    def __init__(self, base_url: str, timeout: int = 30, verbose: bool = False, show_response: bool = True, response_max_chars: int = 2000):
         self.base_url = base_url.rstrip('/')
+        self.timeout = aiohttp.ClientTimeout(total=timeout)
+        self.verbose = verbose
         self.results: List[TestResult] = []
-        self.session = requests.Session()
-        self.session.timeout = TIMEOUT
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.show_response = show_response
+        self.response_max_chars = response_max_chars
+        self.validator = ContentValidator()
         
-    def test_endpoint(self, endpoint: str, method: str = "GET", 
-                     data: Optional[Dict] = None, 
-                     params: Optional[Dict] = None,
-                     description: str = "") -> TestResult:
-        """Test un endpoint spécifique avec retry"""
-        
+        # IDs de test récupérés dynamiquement
+        self.test_data = {
+            'article_id': None,
+            'source_id': None,
+            'cluster_id': None,
+            'topic_name': None,
+            'domain': None,
+            'test_date': datetime.now().strftime('%Y-%m-%d')
+        }
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(timeout=self.timeout)
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+
+    async def make_request(self, method: str, endpoint: str, expected_content: Optional[Dict] = None, **kwargs) -> TestResult:
+        """Fait une requête HTTP et valide le contenu de la réponse"""
         url = f"{self.base_url}{endpoint}"
         start_time = time.time()
+        content_checks = []
+        response_data = None
         
-        for attempt in range(RETRY_COUNT + 1):
-            try:
-                if method.upper() == "GET":
-                    response = self.session.get(url, params=params)
-                elif method.upper() == "POST":
-                    response = self.session.post(url, json=data, params=params)
-                elif method.upper() == "PUT":
-                    response = self.session.put(url, json=data, params=params)
-                elif method.upper() == "DELETE":
-                    response = self.session.delete(url, params=params)
-                else:
-                    raise ValueError(f"Méthode HTTP non supportée: {method}")
-                
+        try:
+            async with self.session.request(method, url, **kwargs) as response:
                 response_time = time.time() - start_time
                 
-                # Essayer de parser la réponse JSON
                 try:
-                    response_data = response.json()
-                except:
-                    response_data = response.text if response.text else None
+                    response_data = await response.json()
+                except aiohttp.ContentTypeError:
+                    response_data = await response.text()
+                except json.JSONDecodeError:
+                    response_data = await response.text()
+                except Exception:
+                    response_data = None
                 
-                result = TestResult(
+                # Déterminer le statut de base
+                if response.status < 400:
+                    status = TestStatus.PASS
+                    message = f"Success - {response.status}"
+                elif response.status == 404:
+                    status = TestStatus.WARN
+                    message = f"Not found - {response.status}"
+                else:
+                    status = TestStatus.FAIL
+                    message = f"HTTP Error - {response.status}"
+
+                # Vérification de la réponse vide/nulle
+                if response_data is None or response_data == [] or response_data == {} or response_data == "":
+                    status = TestStatus.EMPTY_RESPONSE
+                    message = "Réponse nulle ou vide"
+
+                # Validation du contenu si la requête a réussi
+                if status in [TestStatus.PASS, TestStatus.CONTENT_FAIL] and expected_content:
+                    if isinstance(response_data, dict):
+                        content_errors = self.validate_response_content(response_data, expected_content)
+                        if content_errors:
+                            status = TestStatus.CONTENT_FAIL
+                            message = f"Content validation failed: {'; '.join(content_errors[:3])}"
+                            content_checks = content_errors
+                        else:
+                            content_checks = ["[OK] Structure valide"]
+                    elif isinstance(response_data, list):
+                        content_errors = self.validate_list_content(response_data, expected_content)
+                        if content_errors:
+                            status = TestStatus.CONTENT_FAIL
+                            message = f"Content validation failed: {'; '.join(content_errors[:3])}"
+                            content_checks = content_errors
+                        else:
+                            content_checks = [f"[OK] Liste valide ({len(response_data)} éléments)"]
+                
+                return TestResult(
                     endpoint=endpoint,
-                    method=method.upper(),
-                    status_code=response.status_code,
-                    success=200 <= response.status_code < 300,
+                    method=method,
+                    status_code=response.status,
                     response_time=response_time,
-                    error_message=None if 200 <= response.status_code < 300 else f"HTTP {response.status_code}: {response.reason}",
+                    status=status,
+                    message=message,
                     response_data=response_data,
-                    headers=dict(response.headers),
-                    test_description=description
+                    content_checks=content_checks
                 )
-                break
                 
-            except requests.exceptions.RequestException as e:
-                response_time = time.time() - start_time
-                if attempt < RETRY_COUNT:
-                    print(f"  ⚠️  Tentative {attempt + 1} échouée pour {endpoint}, retry dans {RETRY_DELAY}s...")
-                    time.sleep(RETRY_DELAY)
-                    start_time = time.time()  # Reset timer for retry
-                    continue
-                
-                result = TestResult(
-                    endpoint=endpoint,
-                    method=method.upper(),
-                    status_code=None,
-                    success=False,
-                    response_time=response_time,
-                    error_message=f"Erreur de connexion: {str(e)}",
-                    response_data=None,
-                    headers=None,
-                    test_description=description
-                )
-                break
+        except asyncio.TimeoutError:
+            return TestResult(
+                endpoint=endpoint,
+                method=method,
+                status_code=0,
+                response_time=time.time() - start_time,
+                status=TestStatus.FAIL,
+                message="Timeout"
+            )
+        except Exception as e:
+            return TestResult(
+                endpoint=endpoint,
+                method=method,
+                status_code=0,
+                response_time=time.time() - start_time,
+                status=TestStatus.FAIL,
+                message=f"Exception: {str(e)}"
+            )
+
+    def validate_response_content(self, data: Dict, expected: Dict) -> List[str]:
+        """Valide le contenu d'une réponse selon les attentes"""
+        errors = []
         
+        # Validation du type de réponse
+        if expected.get('type') == 'list' and not isinstance(data, list):
+            errors.append("Réponse devrait être une liste")
+            return errors
+        
+        if expected.get('type') == 'object' and not isinstance(data, dict):
+            errors.append("Réponse devrait être un objet")
+            return errors
+        
+        # Validation des stats
+        if expected.get('contains') == 'stats':
+            stats_errors = self.validator.validate_stats(data)
+            errors.extend(stats_errors)
+        
+        # Validation health
+        elif expected.get('contains') == 'health':
+            health_errors = self.validator.validate_health(data)
+            errors.extend(health_errors)
+        
+        # Validation des champs requis
+        if expected.get('required_fields'):
+            for field in expected['required_fields']:
+                if field not in data:
+                    errors.append(f"Champ requis manquant: {field}")
+        
+        return errors
+
+    def validate_list_content(self, data: List, expected: Dict) -> List[str]:
+        """Valide le contenu d'une liste selon les attentes"""
+        errors = []
+        
+        # Validation des contraintes de taille
+        if expected.get('min_items') and len(data) < expected['min_items']:
+            errors.append(f"Nombre d'éléments insuffisant: {len(data)} < {expected['min_items']}")
+        
+        # Validation des articles
+        if expected.get('contains') == 'articles' and len(data) > 0:
+            for i, article in enumerate(data[:3]):  # Vérifier les 3 premiers
+                if isinstance(article, dict):
+                    article_errors = self.validator.validate_article(article)
+                    for error in article_errors:
+                        errors.append(f"Article {i}: {error}")
+        
+        # Validation des sources
+        elif expected.get('contains') == 'sources' and len(data) > 0:
+            for i, source in enumerate(data[:3]):
+                if isinstance(source, dict):
+                    source_errors = self.validator.validate_source(source)
+                    for error in source_errors:
+                        errors.append(f"Source {i}: {error}")
+        
+        # Validation des clusters
+        elif expected.get('contains') == 'clusters' and len(data) > 0:
+            for i, cluster in enumerate(data[:3]):
+                if isinstance(cluster, dict):
+                    cluster_errors = self.validator.validate_cluster(cluster)
+                    for error in cluster_errors:
+                        errors.append(f"Cluster {i}: {error}")
+        
+        return errors
+
+    def _format_response_preview(self, data) -> str:
+        try:
+            if isinstance(data, (dict, list)):
+                text = json.dumps(data, ensure_ascii=False, indent=2)
+            else:
+                text = str(data)
+        except Exception:
+            text = str(data)
+        if len(text) > self.response_max_chars:
+            extra = len(text) - self.response_max_chars
+            text = text[:self.response_max_chars] + f"... (+{extra} chars)"
+        return text
+
+    def log_result(self, result: TestResult):
+        """Log le résultat d'un test avec détails du contenu"""
         self.results.append(result)
-        return result
-    
-    def run_system_tests(self):
-        """Tests des endpoints système"""
-        print("🏥 Tests des Endpoints Système...")
         
-        # Health check
-        self.test_endpoint("/health", description="Health check de l'API")
-        
-        # Documentation
-        self.test_endpoint("/docs", description="Documentation Swagger")
-        self.test_endpoint("/redoc", description="Documentation ReDoc")
-        self.test_endpoint("/openapi.json", description="Schéma OpenAPI")
-    
-    def run_articles_tests(self):
-        """Tests des endpoints articles"""
-        print("📰 Tests des Endpoints Articles...")
-        
-        # Articles de base
-        self.test_endpoint("/api/v1/articles", description="Tous les articles")
-        self.test_endpoint("/api/v1/articles", params={"limit": 5}, description="Articles avec limite")
-        self.test_endpoint("/api/v1/articles", params={"limit": 10, "lang": "fr"}, description="Articles français")
-        
-        # Test avec pagination
-        self.test_endpoint("/api/v1/articles", params={"limit": 5, "offset": 10}, description="Articles avec pagination")
-        
-        # Test avec filtres
-        self.test_endpoint("/api/v1/articles", params={
-            "limit": 5,
-            "date_from": (datetime.now() - timedelta(days=7)).isoformat()
-        }, description="Articles de la semaine dernière")
-        
-        # Test recherche (si disponible)
-        self.test_endpoint("/api/v1/articles/search", params={"q": "test"}, description="Recherche d'articles")
-        
-        # Test article individuel (ID générique)
-        self.test_endpoint("/api/v1/articles/1", description="Article spécifique (ID 1)")
-        self.test_endpoint("/api/v1/articles/999999", description="Article inexistant")
-    
-    def run_sources_tests(self):
-        """Tests des endpoints sources"""
-        print("🔄 Tests des Endpoints Sources...")
-        
-        # Gestion des sources
-        self.test_endpoint("/api/v1/sources", description="Liste des sources")
-        self.test_endpoint("/api/v1/sources/refresh", method="POST", description="Refresh des sources")
-        self.test_endpoint("/api/v1/sources/1", description="Source spécifique")
-        
-        # Test d'ajout de source (peut échouer si pas d'auth)
-        self.test_endpoint("/api/v1/sources", method="POST", data={
-            "url": "https://example.com/rss.xml",
-            "domain": "example.com",
-            "active": True
-        }, description="Ajouter une source")
-    
-    def run_topics_tests(self):
-        """Tests des endpoints topics"""
-        print("🏷️ Tests des Endpoints Topics...")
-        
-        # Topics de base
-        self.test_endpoint("/api/v1/topics", description="Tous les topics")
-        self.test_endpoint("/api/v1/topics", params={"lang": "fr"}, description="Topics français")
-        self.test_endpoint("/api/v1/topics", params={"min_count": 5}, description="Topics avec minimum d'articles")
-        
-        # Topic spécifique
-        self.test_endpoint("/api/v1/topics/1", description="Topic spécifique (ID 1)")
-        self.test_endpoint("/api/v1/topics/1/articles", description="Articles du topic 1")
-        
-        # Topic inexistant
-        self.test_endpoint("/api/v1/topics/999999", description="Topic inexistant")
-    
-    def run_clusters_tests(self):
-        """Tests des endpoints clusters"""
-        print("🔗 Tests des Endpoints Clusters...")
-        
-        # Clusters de base
-        self.test_endpoint("/api/v1/clusters", description="Tous les clusters")
-        self.test_endpoint("/api/v1/clusters", params={"limit": 10}, description="Clusters avec limite")
-        self.test_endpoint("/api/v1/clusters", params={"min_size": 3}, description="Clusters avec taille minimum")
-        
-        # Cluster spécifique
-        self.test_endpoint("/api/v1/clusters/1", description="Cluster spécifique")
-        self.test_endpoint("/api/v1/clusters/1/articles", description="Articles du cluster 1")
-    
-    def run_sentiment_tests(self):
-        """Tests des endpoints sentiment"""
-        print("📈 Tests des Endpoints Sentiment...")
-        
-        # Sentiment par topic
-        for topic_id in [1, 2, 5]:
-            self.test_endpoint(f"/api/v1/sentiment/topic/{topic_id}", 
-                             params={"days": 7}, 
-                             description=f"Sentiment topic {topic_id} (7 jours)")
+        if self.verbose or result.status in [TestStatus.FAIL, TestStatus.WARN, TestStatus.CONTENT_FAIL, TestStatus.EMPTY_RESPONSE]:
+            print(f"{result.status.value} {result.method} {result.endpoint}")
+            print(f"    Status: {result.status_code} | Time: {result.response_time:.2f}s | {result.message}")
             
-            self.test_endpoint(f"/api/v1/sentiment/topic/{topic_id}", 
-                             params={"days": 30}, 
-                             description=f"Sentiment topic {topic_id} (30 jours)")
+            if result.content_checks and self.verbose:
+                for check in result.content_checks[:5]:  # Limiter à 5 messages
+                    print(f"    [CHECK] {check}")
+            
+            if result.status == TestStatus.FAIL and self.verbose:
+                print(f"    [RESPONSE] Response: {str(result.response_data)[:200]}...")
+            
+            if self.show_response and result.response_data is not None:
+                preview = self._format_response_preview(result.response_data)
+                print(f"    [RESPONSE] Réponse API (aperçu):\n{preview}")
+            print()
+
+    async def populate_test_data(self):
+        """Récupère des IDs de test valides depuis l'API"""
+        print("[INFO] Récupération des données de test...")
         
-        # Sentiment par source
-        test_sources = [
-            "www.bbc.com",
-            "www.lemonde.fr", 
-            "www.cnn.com",
-            "techcrunch.com",
-            "www.reuters.com"
+        # Récupérer un article ID
+        result = await self.make_request("GET", "/api/v1/articles?limit=1", 
+                                       expected_content={'contains': 'articles'})
+        if result.status == TestStatus.PASS and result.response_data:
+            articles = result.response_data
+            if isinstance(articles, list) and len(articles) > 0:
+                self.test_data['article_id'] = articles[0].get('id')
+                self.test_data['domain'] = articles[0].get('domain')
+        
+        # Récupérer un source ID
+        result = await self.make_request("GET", "/api/v1/sources",
+                                       expected_content={'contains': 'sources'})
+        if result.status == TestStatus.PASS and result.response_data:
+            sources = result.response_data
+            if isinstance(sources, list) and len(sources) > 0:
+                self.test_data['source_id'] = sources[0].get('id')
+        
+        # Récupérer un cluster ID
+        result = await self.make_request("GET", "/api/v1/clusters?limit_clusters=1")
+        if result.status == TestStatus.PASS and result.response_data:
+            clusters = result.response_data
+            if isinstance(clusters, list) and len(clusters) > 0:
+                self.test_data['cluster_id'] = clusters[0].get('cluster_id')
+        
+        # Récupérer un topic name
+        result = await self.make_request("GET", "/api/v1/topics")
+        if result.status == TestStatus.PASS and result.response_data:
+            topics = result.response_data
+            if isinstance(topics, list) and len(topics) > 0:
+                topic_data = topics[0]
+                if isinstance(topic_data, dict):
+                    self.test_data['topic_name'] = topic_data.get('topic')
+                elif isinstance(topic_data, str):
+                    self.test_data['topic_name'] = topic_data
+        
+        if self.verbose:
+            print(f"[DATA] Données de test: {self.test_data}")
+            print()
+
+    async def test_health_endpoints(self):
+        """Test des endpoints de santé"""
+        print("[INFO] Test des endpoints Health & Monitoring...")
+        
+        tests = [
+            ("/health", {'type': 'object', 'contains': 'health'}),
+            ("/health/detailed", {'type': 'object', 'contains': 'health'}),
+            ("/", {'type': 'object'}),
+            ("/api/v1/system/status", {'type': 'object'}),
         ]
         
-        for source in test_sources:
-            self.test_endpoint(f"/api/v1/sentiment/source/{source}", 
-                             params={"days": 7}, 
-                             description=f"Sentiment {source} (7 jours)")
-        
-        # Tests avec paramètres avancés
-        self.test_endpoint("/api/v1/sentiment/source/www.bbc.com", 
-                         params={"days": 14, "granularity": "daily"}, 
-                         description="Sentiment BBC granularité quotidienne")
-        
-        # Sentiment global (si disponible)
-        self.test_endpoint("/api/v1/sentiment/global", description="Sentiment global")
-        
-        # Test cas d'erreur
-        self.test_endpoint("/api/v1/sentiment/source/inexistant.com", 
-                         params={"days": 7}, 
-                         description="Sentiment source inexistante")
-        
-        self.test_endpoint("/api/v1/sentiment/topic/999999", 
-                         params={"days": 7}, 
-                         description="Sentiment topic inexistant")
-    
-    def run_summaries_tests(self):
-        """Tests des endpoints synthèses"""
-        print("📊 Tests des Endpoints Synthèses...")
-        
-        # Synthèses générales
-        self.test_endpoint("/api/v1/summaries/general", description="Synthèse générale par défaut")
-        
-        self.test_endpoint("/api/v1/summaries/general", 
-                         params={"since_hours": 24, "target_sentences": 10}, 
-                         description="Synthèse 24h, 10 phrases")
-        
-        self.test_endpoint("/api/v1/summaries/general", 
-                         params={"since_hours": 48, "target_sentences": 20, "lang": "fr"}, 
-                         description="Synthèse 48h, 20 phrases, français")
-        
-        # Synthèses par topic
-        self.test_endpoint("/api/v1/summaries/topic/1", description="Synthèse topic 1")
-        
-        # Synthèses par source
-        self.test_endpoint("/api/v1/summaries/source/www.bbc.com", description="Synthèse BBC")
-        
-        # Trending topics
-        self.test_endpoint("/api/v1/summaries/trending", description="Topics en tendance")
-    
-    def run_stats_tests(self):
-        """Tests des endpoints statistiques"""
-        print("📊 Tests des Endpoints Statistiques...")
-        
-        # Stats générales
-        self.test_endpoint("/api/v1/stats/general", description="Statistiques générales")
-        self.test_endpoint("/api/v1/stats/sources", description="Statistiques par source")
-        self.test_endpoint("/api/v1/stats/topics", description="Statistiques par topic")
-        self.test_endpoint("/api/v1/stats/timeline", description="Timeline des statistiques")
-        
-        # Stats avec paramètres
-        self.test_endpoint("/api/v1/stats/timeline", 
-                         params={"granularity": "daily", "days": 30}, 
-                         description="Timeline quotidienne 30 jours")
-    
-    def run_export_tests(self):
-        """Tests des endpoints export"""
-        print("📥 Tests des Endpoints Export...")
-        
-        # Export articles CSV
-        self.test_endpoint("/api/v1/exports/articles.csv", description="Export articles CSV de base")
-        
-        self.test_endpoint("/api/v1/exports/articles.csv", 
-                         params={"limit": 10}, 
-                         description="Export articles CSV limité")
-        
-        self.test_endpoint("/api/v1/exports/articles.csv", 
-                         params={"lang": "fr", "limit": 5}, 
-                         description="Export articles français CSV")
-        
-        self.test_endpoint("/api/v1/exports/articles.csv", 
-                         params={
-                             "lang": "fr", 
-                             "topic": "tech",
-                             "date_from": (datetime.now() - timedelta(days=7)).isoformat(),
-                             "limit": 20
-                         }, 
-                         description="Export articles tech français 7 jours")
-        
-        # Autres exports
-        self.test_endpoint("/api/v1/exports/sentiment.csv", description="Export sentiment CSV")
-        self.test_endpoint("/api/v1/exports/stats.json", description="Export stats JSON")
-        self.test_endpoint("/api/v1/exports/topics.json", description="Export topics JSON")
-    
-    def run_search_tests(self):
-        """Tests des endpoints recherche"""
-        print("🔍 Tests des Endpoints Recherche...")
-        
-        # Recherche globale
-        search_queries = ["intelligence artificielle", "climate change", "tech", "politics"]
-        
-        for query in search_queries:
-            self.test_endpoint("/api/v1/search", 
-                             params={"q": query}, 
-                             description=f"Recherche globale: {query}")
-        
-        # Recherche avancée
-        self.test_endpoint("/api/v1/search", 
-                         params={
-                             "q": "AI", 
-                             "lang": "en", 
-                             "sentiment": "positive",
-                             "date_range": "last_week"
-                         }, 
-                         description="Recherche avancée AI positive")
-        
-        # Recherche par entités
-        self.test_endpoint("/api/v1/search/entities", 
-                         params={"entity_type": "PERSON"}, 
-                         description="Recherche entités personnes")
-        
-        # Recherche similarité
-        self.test_endpoint("/api/v1/search/similar/1", description="Articles similaires à l'article 1")
-    
-    def run_admin_tests(self):
-        """Tests des endpoints admin (peuvent nécessiter auth)"""
-        print("🛠️ Tests des Endpoints Administration...")
-        
-        # Configuration
-        self.test_endpoint("/api/v1/admin/config", description="Configuration système")
-        
-        # Monitoring
-        self.test_endpoint("/api/v1/admin/monitoring", description="Monitoring système")
-        
-        # Jobs
-        self.test_endpoint("/api/v1/admin/jobs", description="Liste des jobs")
-        
-        # DB stats
-        self.test_endpoint("/api/v1/admin/db/stats", description="Statistiques base de données")
-    
-    def run_auth_tests(self):
-        """Tests des endpoints authentification"""
-        print("🔐 Tests des Endpoints Authentification...")
-        
-        # Test login (peut échouer si pas configuré)
-        self.test_endpoint("/api/v1/auth/login", 
-                         method="POST", 
-                         data={"username": "test", "password": "test"}, 
-                         description="Test login")
-        
-        # Test profil
-        self.test_endpoint("/api/v1/auth/me", description="Profil utilisateur")
-    
-    def run_edge_case_tests(self):
-        """Tests des cas limites et d'erreur"""
-        print("⚠️ Tests des Cas Limites...")
-        
-        # Paramètres invalides
-        self.test_endpoint("/api/v1/articles", 
-                         params={"limit": -1}, 
-                         description="Limite négative")
-        
-        self.test_endpoint("/api/v1/articles", 
-                         params={"limit": 999999}, 
-                         description="Limite très élevée")
-        
-        self.test_endpoint("/api/v1/sentiment/topic/abc", 
-                         description="Topic ID non numérique")
-        
-        self.test_endpoint("/api/v1/sentiment/source/", 
-                         description="Source vide")
-        
-        # Dates invalides
-        self.test_endpoint("/api/v1/articles", 
-                         params={"date_from": "invalid-date"}, 
-                         description="Date invalide")
-        
-        # Endpoints inexistants
-        self.test_endpoint("/api/v1/nonexistent", description="Endpoint inexistant")
-        self.test_endpoint("/api/v2/articles", description="Version API inexistante")
-    
-    def run_all_tests(self):
-        """Exécute tous les tests"""
-        print("🚀 Début des tests complets de l'API NewsAPI")
-        print("=" * 60)
-        
-        start_time = time.time()
-        
-        # Tests par catégorie
-        self.run_system_tests()
-        self.run_articles_tests()
-        self.run_sources_tests()
-        self.run_topics_tests()
-        self.run_clusters_tests()
-        self.run_sentiment_tests()
-        self.run_summaries_tests()
-        self.run_stats_tests()
-        self.run_export_tests()
-        self.run_search_tests()
-        self.run_admin_tests()
-        self.run_auth_tests()
-        self.run_edge_case_tests()
-        
-        total_time = time.time() - start_time
-        
-        print(f"\n✅ Tests terminés en {total_time:.2f} secondes")
-        print("=" * 60)
-    
-    def generate_report(self) -> str:
-        """Génère un rapport détaillé des tests"""
-        if not self.results:
-            return "Aucun test exécuté"
-        
-        # Statistiques
-        total_tests = len(self.results)
-        successful_tests = sum(1 for r in self.results if r.success)
-        failed_tests = total_tests - successful_tests
-        success_rate = (successful_tests / total_tests) * 100
-        avg_response_time = sum(r.response_time for r in self.results) / total_tests
-        
-        # Grouper par catégorie
-        categories = {}
-        for result in self.results:
-            category = self.get_category(result.endpoint)
-            if category not in categories:
-                categories[category] = []
-            categories[category].append(result)
-        
-        # Générer le rapport
-        report = []
-        report.append("📊 RAPPORT DE TEST COMPLET - NewsAPI")
-        report.append("=" * 80)
-        report.append(f"📅 Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        report.append(f"🎯 URL de base: {self.base_url}")
-        report.append("")
-        
-        # Résumé exécutif
-        report.append("📈 RÉSUMÉ EXÉCUTIF")
-        report.append("-" * 40)
-        report.append(f"Total des tests: {total_tests}")
-        report.append(f"✅ Succès: {successful_tests}")
-        report.append(f"❌ Échecs: {failed_tests}")
-        report.append(f"📊 Taux de succès: {success_rate:.1f}%")
-        report.append(f"⏱️ Temps de réponse moyen: {avg_response_time:.3f}s")
-        report.append("")
-        
-        # Résumé par catégorie
-        report.append("📋 RÉSUMÉ PAR CATÉGORIE")
-        report.append("-" * 40)
-        for category, tests in categories.items():
-            cat_success = sum(1 for t in tests if t.success)
-            cat_total = len(tests)
-            cat_rate = (cat_success / cat_total * 100) if cat_total > 0 else 0
-            status = "✅" if cat_rate == 100 else "⚠️" if cat_rate >= 50 else "❌"
-            report.append(f"{status} {category}: {cat_success}/{cat_total} ({cat_rate:.1f}%)")
-        report.append("")
-        
-        # Tests échoués (priorité)
-        failed_results = [r for r in self.results if not r.success]
-        if failed_results:
-            report.append("❌ TESTS ÉCHOUÉS (DÉTAILS)")
-            report.append("-" * 40)
-            for result in failed_results:
-                report.append(f"🔴 {result.method} {result.endpoint}")
-                report.append(f"   Description: {result.test_description}")
-                report.append(f"   Erreur: {result.error_message}")
-                if result.status_code:
-                    report.append(f"   Code HTTP: {result.status_code}")
-                report.append(f"   Temps: {result.response_time:.3f}s")
-                report.append("")
-        
-        # Détails par catégorie
-        report.append("📊 DÉTAILS PAR CATÉGORIE")
-        report.append("-" * 40)
-        
-        for category, tests in categories.items():
-            report.append(f"\n🔹 {category.upper()}")
-            report.append("-" * 20)
-            
-            for result in tests:
-                status = "✅" if result.success else "❌"
-                report.append(f"{status} {result.method} {result.endpoint}")
-                report.append(f"   📝 {result.test_description}")
-                
-                if result.success:
-                    report.append(f"   ✅ HTTP {result.status_code} - {result.response_time:.3f}s")
-                    if result.response_data:
-                        # Informations sur la réponse
-                        if isinstance(result.response_data, dict):
-                            if 'count' in result.response_data:
-                                report.append(f"   📊 Éléments retournés: {result.response_data.get('count', 'N/A')}")
-                            elif isinstance(result.response_data, list):
-                                report.append(f"   📊 Éléments retournés: {len(result.response_data)}")
-                        elif isinstance(result.response_data, list):
-                            report.append(f"   📊 Éléments retournés: {len(result.response_data)}")
-                else:
-                    report.append(f"   ❌ {result.error_message}")
-                    if result.status_code:
-                        report.append(f"   🔢 HTTP {result.status_code}")
-                
-                report.append("")
-        
-        # Recommandations
-        report.append("💡 RECOMMANDATIONS")
-        report.append("-" * 40)
-        
-        if failed_tests == 0:
-            report.append("🎉 Excellent! Tous les tests sont passés.")
-        elif success_rate >= 80:
-            report.append("👍 Bon score global. Corriger les quelques endpoints défaillants.")
-        elif success_rate >= 50:
-            report.append("⚠️ Score moyen. Révision nécessaire des endpoints échoués.")
-        else:
-            report.append("🚨 Score faible. Révision complète recommandée.")
-        
-        # Actions recommandées
-        if any(r.error_message and "connexion" in r.error_message.lower() for r in self.results):
-            report.append("🔧 Vérifier que l'API est démarrée: docker compose up -d")
-        
-        if any(r.status_code == 500 for r in self.results):
-            report.append("🔧 Erreurs 500 détectées: vérifier les logs serveur")
-        
-        if any(r.status_code == 404 for r in self.results):
-            report.append("🔧 Endpoints 404: vérifier la documentation /docs")
-        
-        report.append("")
-        report.append("📚 Pour plus d'infos: http://localhost:8000/docs")
-        report.append("=" * 80)
-        
-        return "\n".join(report)
-    
-    def get_category(self, endpoint: str) -> str:
-        """Détermine la catégorie d'un endpoint"""
-        if endpoint in ["/health", "/docs", "/redoc", "/openapi.json"]:
-            return "Système"
-        elif "/articles" in endpoint:
-            return "Articles"
-        elif "/sources" in endpoint:
-            return "Sources"
-        elif "/topics" in endpoint:
-            return "Topics"
-        elif "/clusters" in endpoint:
-            return "Clusters"
-        elif "/sentiment" in endpoint:
-            return "Sentiment"
-        elif "/summaries" in endpoint:
-            return "Synthèses"
-        elif "/stats" in endpoint:
-            return "Statistiques"
-        elif "/exports" in endpoint:
-            return "Export"
-        elif "/search" in endpoint:
-            return "Recherche"
-        elif "/admin" in endpoint:
-            return "Administration"
-        elif "/auth" in endpoint:
-            return "Authentification"
-        else:
-            return "Autres"
-    
-    def save_report(self, filename: str = None):
-        """Sauvegarde le rapport dans un fichier"""
-        if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"newsapi_test_report_{timestamp}.txt"
-        
-        report = self.generate_report()
-        
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write(report)
-        
-        print(f"📄 Rapport sauvegardé: {filename}")
-        return filename
-    
-    def save_csv_report(self, filename: str = None):
-        """Sauvegarde un rapport CSV détaillé"""
-        if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"newsapi_test_results_{timestamp}.csv"
-        
-        with open(filename, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                'Endpoint', 'Method', 'Status_Code', 'Success', 
-                'Response_Time', 'Error_Message', 'Description', 'Category'
-            ])
-            
-            for result in self.results:
-                writer.writerow([
-                    result.endpoint,
-                    result.method,
-                    result.status_code or '',
-                    result.success,
-                    f"{result.response_time:.3f}",
-                    result.error_message or '',
-                    result.test_description,
-                    self.get_category(result.endpoint)
-                ])
-        
-        print(f"📊 Rapport CSV sauvegardé: {filename}")
-        return filename
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
 
-def main():
-    """Fonction principale"""
-    print("🧪 Script de Test Complet - NewsAPI")
-    print("Assurez-vous que l'API est démarrée: docker compose up -d")
+    async def test_articles_endpoints(self):
+        """Test des endpoints d'articles"""
+        print("[INFO] Test des endpoints Articles...")
+        
+        tests = [
+            ("/api/v1/articles", {'contains': 'articles'}),
+            ("/api/v1/articles?limit=5&lang=fr", {'contains': 'articles'}),
+            ("/api/v1/articles?q=test&has_full_text=true", {'contains': 'articles'}),
+            ("/api/v1/articles?topic=tech&order=asc", {'contains': 'articles'}),
+        ]
+        
+        # Test avec ID spécifique si disponible
+        if self.test_data['article_id']:
+            tests.append((f"/api/v1/articles/{self.test_data['article_id']}", 
+                          {'type': 'object', 'contains': 'articles'}))
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+
+    async def test_search_endpoints(self):
+        """Test des endpoints de recherche"""
+        print("[INFO] Test des endpoints Search...")
+        
+        tests = [
+            ("/api/v1/search?q=test", {'contains': 'articles'}),
+            ("/api/v1/search?q=macron&lang=fr&limit=5", {'contains': 'articles'}),
+            ("/api/v1/search/semantic?q=intelligence&k=5", {'contains': 'articles'}),
+            ("/api/v1/search/entities?entity_type=PERSON&since_days=7", {}),
+            ("/api/v1/search/entities?entity_type=ORG&entity_name=OpenAI", {}),
+        ]
+        
+        # Test articles similaires si ID disponible
+        if self.test_data['article_id']:
+            tests.append((f"/api/v1/search/similar/{self.test_data['article_id']}", 
+                          {'contains': 'articles'}))
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+
+    async def test_sources_endpoints(self):
+        """Test des endpoints de sources"""
+        print("[INFO] Test des endpoints Sources...")
+        
+        tests = [
+            ("/api/v1/sources", {'contains': 'sources', 'min_items': 1}),
+        ]
+        
+        # Test source spécifique si ID disponible
+        if self.test_data['source_id']:
+            tests.append((f"/api/v1/sources/{self.test_data['source_id']}", 
+                          {'type': 'object', 'contains': 'sources'}))
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+        
+        # Test POST refresh
+        result = await self.make_request("POST", "/api/v1/sources/refresh")
+        self.log_result(result)
+
+    async def test_summaries_endpoints(self):
+        """Test des endpoints de résumés"""
+        print("[INFO] Test des endpoints Summaries...")
+        
+        tests = [
+            ("/api/v1/summaries?limit=3", {}),
+            ("/api/v1/summaries?since_hours=48&lang=fr", {}),
+            ("/api/v1/summaries/general?target_sentences=5", {}),
+            ("/api/v1/summaries/trending?since_hours=24", {}),
+        ]
+        
+        # Test avec topic et domain si disponibles
+        if self.test_data['topic_name']:
+            tests.append((f"/api/v1/summaries/topic/{self.test_data['topic_name']}", {}))
+        
+        if self.test_data['domain']:
+            tests.append((f"/api/v1/summaries/source/{self.test_data['domain']}", {}))
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+
+    async def test_synthesis_endpoints(self):
+        """Test des endpoints de synthèse"""
+        print("[INFO] Test des endpoints Synthesis...")
+        
+        tests = [
+            ("/api/v1/synthesis?since_hours=24&limit_docs=5", {}),
+            ("/api/v1/synthesis?q=test&lang=fr", {}),
+        ]
+        
+        # Test avec source et topic si disponibles
+        if self.test_data['source_id']:
+            tests.append((f"/api/v1/synthesis?source_id={self.test_data['source_id']}", {}))
+        
+        if self.test_data['topic_name']:
+            tests.append((f"/api/v1/synthesis?topic={self.test_data['topic_name']}", {}))
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+
+    async def test_topics_endpoints(self):
+        """Test des endpoints de topics"""
+        print("[INFO] Test des endpoints Topics...")
+        
+        tests = [
+            ("/api/v1/topics", {}),
+        ]
+        
+        # Test avec topic spécifique si disponible
+        if self.test_data['topic_name']:
+            tests.extend([
+                (f"/api/v1/topics/{self.test_data['topic_name']}", {}),
+                (f"/api/v1/topics/{self.test_data['topic_name']}/articles?limit=5", {'contains': 'articles'}),
+            ])
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+
+    async def test_clusters_endpoints(self):
+        """Test des endpoints de clusters"""
+        print("[INFO] Test des endpoints Clusters...")
+        
+        tests = [
+            ("/api/v1/clusters?limit_clusters=5", {'contains': 'clusters'}),
+            ("/api/v1/clusters?since_hours=24", {'contains': 'clusters'}),
+        ]
+        
+        # Test avec cluster spécifique si disponible
+        if self.test_data['cluster_id']:
+            tests.extend([
+                (f"/api/v1/clusters/{self.test_data['cluster_id']}", {}),
+                (f"/api/v1/clusters/{self.test_data['cluster_id']}/articles?limit=5", {'contains': 'articles'}),
+            ])
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+
+    async def test_sentiment_endpoints(self):
+        """Test des endpoints de sentiment"""
+        print("[INFO] Test des endpoints Sentiment...")
+        
+        tests = [
+            ("/api/v1/sentiment/global?days=7", {}),
+            ("/api/v1/sentiment/global?days=30&granularity=weekly", {}),
+            ("/api/v1/sentiment/topic/1?days=7", {}),
+        ]
+        
+        # Test avec domain si disponible
+        if self.test_data['domain']:
+            tests.append((f"/api/v1/sentiment/source/{self.test_data['domain']}?days=7", {}))
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+
+    async def test_stats_endpoints(self):
+        """Test des endpoints de statistiques"""
+        print("[INFO] Test des endpoints Stats...")
+        
+        tests = [
+            ("/api/v1/stats/general", {
+                'type': 'object', 
+                'contains': 'stats',
+                'required_fields': ['total_articles', 'unique_domains']
+            }),
+            ("/api/v1/stats/sources", {'type': 'object'}),
+            ("/api/v1/stats/topics", {'type': 'object'}),
+            ("/api/v1/stats/timeline?days=30", {}),
+        ]
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+
+    async def test_relations_endpoints(self):
+        """Test des endpoints de relations"""
+        print("[INFO] Test des endpoints Relations...")
+        
+        tests = [
+            (f"/api/v1/relations/sources?date={self.test_data['test_date']}&limit=5", {}),
+            (f"/api/v1/relations/sources?date={self.test_data['test_date']}&min_weight=2.0", {}),
+        ]
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+
+    async def test_graph_endpoints(self):
+        """Test des endpoints de graph"""
+        print("[INFO] Test des endpoints Graph...")
+        
+        tests = []
+        
+        # Test avec cluster si disponible
+        if self.test_data['cluster_id']:
+            tests.append((f"/api/v1/graph/cluster/{self.test_data['cluster_id']}", {}))
+        else:
+            # Test avec cluster fictif pour vérifier la réponse
+            tests.append(("/api/v1/graph/cluster/test123", {}))
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+
+    async def test_exports_endpoints(self):
+        """Test des endpoints d'export"""
+        print("[INFO] Test des endpoints Exports...")
+        
+        endpoints = [
+            "/api/v1/exports/articles.csv?limit=5",
+            "/api/v1/exports/articles.csv?lang=fr&limit=3",
+            "/api/v1/exports/sentiment.csv?days=7",
+            "/api/v1/exports/topics.json",
+            "/api/v1/exports/stats.json",
+        ]
+        
+        for endpoint in endpoints:
+            result = await self.make_request("GET", endpoint)
+            
+            # Validation spéciale pour les exports
+            if result.status == TestStatus.PASS and result.response_data:
+                if endpoint.endswith('.csv') and isinstance(result.response_data, str):
+                    if not result.response_data.strip():
+                        result.status = TestStatus.EMPTY_RESPONSE
+                        result.message = "Fichier CSV vide"
+                    elif ',' not in result.response_data:
+                        result.status = TestStatus.CONTENT_FAIL
+                        result.message = "Format CSV invalide"
+                    else:
+                        result.content_checks = ["[OK] Format CSV valide"]
+            
+            self.log_result(result)
+
+    async def test_admin_endpoints(self):
+        """Test des endpoints d'administration"""
+        print("🔧 Test des endpoints Admin...")
+        
+        tests = [
+            ("/api/v1/admin/diagnose", {
+                'type': 'object',
+                'required_fields': ['status', 'sources', 'articles']
+            }),
+            ("/api/v1/admin/collection-status", {
+                'type': 'object',
+                'required_fields': ['collection_enabled', 'health']
+            }),
+        ]
+        
+        for endpoint, expected in tests:
+            result = await self.make_request("GET", endpoint, expected_content=expected)
+            self.log_result(result)
+        
+        # Test POST admin
+        result = await self.make_request("POST", "/api/v1/admin/fix-sources")
+        self.log_result(result)
     
-    # Demander confirmation
+    def print_per_endpoint_results(self):
+        """Affiche un tableau compact avec le résultat de CHAQUE endpoint testé."""
+        # Construire des lignes : [status, method, endpoint, code, time, note]
+        rows = []
+        for r in self.results:
+            note = r.message
+            # Raccourcir les messages trop longs
+            if note and len(note) > 80:
+                note = note[:77] + "..."
+            rows.append([r.status.value.split()[0], r.method, r.endpoint, str(r.status_code), f"{r.response_time:.2f}s", note or ""])  # status icon only
+        
+        # Largeurs de colonne
+        widths = [0,0,0,0,0,0]
+        for row in rows:
+            for i, cell in enumerate(row):
+                widths[i] = max(widths[i], len(cell))
+        
+        headers = ["Statut", "Méthode", "Endpoint", "Code", "Temps", "Détail"]
+        for i, h in enumerate(headers):
+            widths[i] = max(widths[i], len(h))
+        
+        sep = "-" * (sum(widths) + len(widths)*3 + 1)
+        print("\n[DETAIL] DÉTAIL PAR ENDPOINT\n" + sep)
+        # Header
+        line = "| " + " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers)) + " |"
+        print(line)
+        print(sep)
+        # Rows
+        for row in rows:
+            line = "| " + " | ".join(str(cell).ljust(widths[i]) for i, cell in enumerate(row)) + " |"
+            print(line)
+        print(sep + "\n")
+
+    def print_summary(self):
+        """Affiche un résumé détaillé des tests"""
+        print("=" * 70)
+        print("[SUMMARY] RÉSUMÉ COMPLET DES TESTS")
+        print("=" * 70)
+        
+        total = len(self.results)
+        passed = len([r for r in self.results if r.status == TestStatus.PASS])
+        failed = len([r for r in self.results if r.status == TestStatus.FAIL])
+        warned = len([r for r in self.results if r.status == TestStatus.WARN])
+        content_failed = len([r for r in self.results if r.status == TestStatus.CONTENT_FAIL])
+        empty_responses = len([r for r in self.results if r.status == TestStatus.EMPTY_RESPONSE])
+        
+        print(f"Total tests: {total}")
+        print(f"[SUCCESS] Succès complets: {passed}")
+        print(f"[FAILED] Échecs techniques: {failed}")
+        print(f"[CONTENT_FAIL] Échecs de contenu: {content_failed}")
+        print(f"[WARNED] Avertissements (e.g., 404): {warned}")
+        print(f"[EMPTY] Réponses vides/nulles: {empty_responses}")
+        
+        success_rate = ((passed) / total) * 100 if total > 0 else 0
+        quality_rate = ((passed) / (total - warned)) * 100 if (total - warned) > 0 else 0
+        
+        print(f"[STATS] Taux de succès global: {success_rate:.1f}%")
+        print(f"[QUALITY] Taux de qualité (hors 404): {quality_rate:.1f}%")
+        
+        # Temps de réponse moyen
+        avg_time = sum(r.response_time for r in self.results) / total if total > 0 else 0
+        print(f"[TIME] Temps moyen: {avg_time:.2f}s")
+        
+        # Endpoints les plus lents
+        slowest = sorted(self.results, key=lambda x: x.response_time, reverse=True)[:3]
+        print(f"\n[SLOW_ENDPOINTS] Endpoints les plus lents:")
+        for result in slowest:
+            print(f"    {result.endpoint}: {result.response_time:.2f}s")
+        
+        # Détails des problèmes de contenu
+        content_issues = [r for r in self.results if r.status == TestStatus.CONTENT_FAIL]
+        if content_issues:
+            print(f"\n[CONTENT_ISSUES] Problèmes de contenu détectés:")
+            for result in content_issues:
+                print(f"    {result.endpoint}: {result.message}")
+                if result.content_checks:
+                    for check in result.content_checks[:2]:
+                        print(f"      - {check}")
+        
+        # Détails des réponses vides/nulles
+        empty_issues = [r for r in self.results if r.status == TestStatus.EMPTY_RESPONSE]
+        if empty_issues:
+            print(f"\n[EMPTY_ENDPOINTS] Endpoints avec réponses vides ou nulles:")
+            for result in empty_issues:
+                print(f"    {result.endpoint}: {result.message}")
+        
+        # Échecs techniques
+        technical_failures = [r for r in self.results if r.status == TestStatus.FAIL]
+        if technical_failures:
+            print(f"\n[FAILED] Échecs techniques:")
+            for result in technical_failures:
+                print(f"    {result.endpoint}: {result.message}")
+        
+        print("\n" + "=" * 70)
+        
+        return passed, failed, warned, content_failed, empty_responses
+
+    async def run_all_tests(self, categories: Optional[List[str]] = None):
+        """Lance tous les tests ou seulement les catégories spécifiées"""
+        
+        all_categories = {
+            'health': self.test_health_endpoints,
+            'articles': self.test_articles_endpoints,
+            'search': self.test_search_endpoints,
+            'sources': self.test_sources_endpoints,
+            'summaries': self.test_summaries_endpoints,
+            'synthesis': self.test_synthesis_endpoints,
+            'topics': self.test_topics_endpoints,
+            'clusters': self.test_clusters_endpoints,
+            'sentiment': self.test_sentiment_endpoints,
+            'stats': self.test_stats_endpoints,
+            'relations': self.test_relations_endpoints,
+            'graph': self.test_graph_endpoints,
+            'exports': self.test_exports_endpoints,
+            'admin': self.test_admin_endpoints,
+        }
+        
+        # Filtrer les catégories si spécifiées
+        if categories:
+            test_categories = {k: v for k, v in all_categories.items() if k in categories}
+            if not test_categories:
+                print(f"[ERROR] Catégories invalides: {categories}")
+                print(f"Catégories disponibles: {list(all_categories.keys())}")
+                return
+        else:
+            test_categories = all_categories
+
+        await self.populate_test_data()
+
+        for category, test_method in test_categories.items():
+            await test_method()
+
+## Fonction principale et exécution du script
+
+async def main():
+    parser = argparse.ArgumentParser(description="Script de test complet pour l'API NewsAI.")
+    parser.add_argument("--base-url", type=str, required=True, help="URL de base de l'API (ex: http://localhost:8000)")
+    parser.add_argument("--timeout", type=int, default=30, help="Délai d'attente maximum pour chaque requête en secondes")
+    parser.add_argument("--verbose", action="store_true", help="Afficher les détails de chaque test")
+    parser.add_argument("--no-response-preview", action="store_false", dest="show_response", help="Ne pas afficher l'aperçu de la réponse API pour les tests individuels")
+    parser.add_argument("--response-max-chars", type=int, default=2000, help="Nombre maximal de caractères à afficher pour l'aperçu de la réponse API")
+    parser.add_argument("--only", type=str, help="Exécuter seulement certaines catégories de tests (ex: health,articles)")
+    
+    args = parser.parse_args()
+
+    # Convertir les catégories en liste si spécifiées
+    only_categories = [cat.strip() for cat in args.only.split(',')] if args.only else None
+
+    print(f"[START] Démarrage des tests de l'API NewsAI à l'adresse: {args.base_url}")
+    print(f"[TIMEOUT] Timeout par requête: {args.timeout}s")
+    if only_categories:
+        print(f"[CATEGORIES] Catégories de tests sélectionnées: {', '.join(only_categories)}")
+    print("-" * 70)
+
+    tester = None
     try:
-        response = input("\nCommencer les tests? (y/N): ").strip().lower()
-        if response != 'y':
-            print("Tests annulés.")
-            return
-    except KeyboardInterrupt:
-        print("\nTests annulés.")
-        return
-    
-    # Initialiser le testeur
-    tester = NewsAPITester()
-    
-    try:
-        # Exécuter tous les tests
-        tester.run_all_tests()
-        
-        # Générer et afficher le rapport
-        print("\n" + tester.generate_report())
-        
-        # Sauvegarder les rapports
-        txt_file = tester.save_report()
-        csv_file = tester.save_csv_report()
-        
-        print(f"\n📁 Fichiers générés:")
-        print(f"   📄 {txt_file}")
-        print(f"   📊 {csv_file}")
-        
-    except KeyboardInterrupt:
-        print("\n\n⏹️ Tests interrompus par l'utilisateur")
-        if tester.results:
-            print("Génération du rapport partiel...")
-            print(tester.generate_report())
+        async with NewsAIAPITester(
+            base_url=args.base_url, 
+            timeout=args.timeout, 
+            verbose=args.verbose, 
+            show_response=args.show_response,
+            response_max_chars=args.response_max_chars
+        ) as tester:
+            await tester.run_all_tests(categories=only_categories)
+    except aiohttp.ClientConnectorError as e:
+        print(f"\n[CRITICAL ERROR] Impossible de se connecter à l'API à l'adresse {args.base_url}.")
+        print(f"Vérifiez que l'API est en cours d'exécution et accessible. Détails: {e}")
+        sys.exit(1)
     except Exception as e:
-        print(f"\n❌ Erreur lors des tests: {e}")
-        if tester.results:
-            print("Génération du rapport partiel...")
-            print(tester.generate_report())
+        print(f"\n[UNEXPECTED ERROR] lors de l'exécution des tests: {e}")
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        if tester:
+            tester.print_per_endpoint_results()
+            passed, failed, warned, content_failed, empty_responses = tester.print_summary()
+            
+            if failed > 0 or content_failed > 0 or empty_responses > 0:
+                print("\n[ALERT] DES TESTS ONT ÉCHOUÉ OU PRÉSENTENT DES PROBLÈMES DE CONTENU.")
+                sys.exit(1)
+            elif warned > 0:
+                print("\n[WARNING] TOUS LES TESTS TECHNIQUES ONT RÉUSSI, MAIS DES AVERTISSEMENTS ONT ÉTÉ ÉMIS (e.g., 404).")
+                sys.exit(0) # Sortie réussie car ce sont des avertissements
+            else:
+                print("\n[SUCCESS] TOUS LES TESTS ONT RÉUSSI AVEC SUCCÈS !")
+                sys.exit(0)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
