@@ -1,5 +1,6 @@
 from typing import Dict, Any
 from ..utils.http import client
+from .facts import extract_facts
 
 # ✅ IMPORT CONDITIONNEL: trafilatura avec fallback
 try:
@@ -51,8 +52,15 @@ def enrich_html(url: str) -> Dict[str, Any]:
                     # Nettoie les espaces multiples
                     text = re.sub(r'\s+', ' ', text).strip()
             
-            return {"full_text": text or None, "jsonld": None}
+            # Extract facts from the content
+            facts = extract_facts(text) if text else []
+            
+            return {
+                "full_text": text or None, 
+                "jsonld": None,
+                "facts": facts
+            }
             
     except Exception as e:
         print(f"[enrichment] Error enriching {url}: {e}")
-        return {"full_text": None, "jsonld": None}
+        return {"full_text": None, "jsonld": None, "facts": []}

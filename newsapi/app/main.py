@@ -428,6 +428,45 @@ async def process_sentiment_analysis(
             "timestamp": datetime.utcnow()
         }
 
+@app.post("/api/v1/admin/process-bertopic")
+async def process_bertopic_clustering(
+    limit: int = 1000,
+    db: AsyncSession = Depends(get_session)
+):
+    """Process articles using BERTopic for advanced clustering"""
+    try:
+        # Try to import and use BERTopic
+        try:
+            from .services.topics_bertopic import build_and_assign
+            BERTOPIC_AVAILABLE = True
+        except ImportError:
+            BERTOPIC_AVAILABLE = False
+        
+        if not BERTOPIC_AVAILABLE:
+            return {
+                "status": "error",
+                "message": "BERTopic not available. Install required packages: pip install bertopic sentence-transformers",
+                "timestamp": datetime.utcnow()
+            }
+        
+        logger.info("🤖 Starting BERTopic clustering...")
+        await build_and_assign(db)
+        
+        return {
+            "status": "success",
+            "message": "BERTopic clustering completed successfully",
+            "limit_processed": limit,
+            "timestamp": datetime.utcnow()
+        }
+        
+    except Exception as e:
+        logger.error(f"BERTopic clustering error: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "timestamp": datetime.utcnow()
+        }
+
 # Health endpoint for monitoring
 @app.get("/api/v1/system/status")
 async def system_status():

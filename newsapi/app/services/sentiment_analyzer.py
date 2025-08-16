@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text, select, update
 from ..core.models import Article
 from .llm import generate_llm
+from .sentiment_simple import label_text as simple_sentiment
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,32 @@ def analyze_sentiment_simple(text: str) -> Tuple[float, str, float]:
         confidence = 0.6
     
     return sentiment_score, label, confidence
+
+def analyze_sentiment_enhanced(text: str) -> Tuple[float, str, float]:
+    """Enhanced rule-based sentiment analysis using sentiment_simple.py"""
+    if not text:
+        return 0.0, "neutral", 0.5
+    
+    try:
+        # Use the enhanced simple sentiment analyzer
+        label, score = simple_sentiment(text)
+        
+        # Convert label to expected format and calculate confidence
+        if label == "pos":
+            sentiment_label = "positive"
+            confidence = min(0.9, 0.6 + abs(score) * 0.3)
+        elif label == "neg":
+            sentiment_label = "negative"
+            confidence = min(0.9, 0.6 + abs(score) * 0.3)
+        else:
+            sentiment_label = "neutral"
+            confidence = 0.6
+            
+        return float(score), sentiment_label, confidence
+        
+    except Exception as e:
+        logger.warning(f"Enhanced sentiment analysis failed: {e}")
+        return analyze_sentiment_simple(text)
 
 async def analyze_sentiment_llm(text: str) -> Tuple[float, str, float]:
     """Analyze sentiment using LLM"""

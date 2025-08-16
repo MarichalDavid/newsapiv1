@@ -131,7 +131,7 @@ class ContentValidator:
         return errors
 
 class NewsAIAPITester:
-    def __init__(self, base_url: str, timeout: int = 30, verbose: bool = False, show_response: bool = True, response_max_chars: int = 2000):
+    def __init__(self, base_url: str, timeout: int = 30, verbose: bool = False, show_response: bool = True, response_max_chars: int = 2000, skip_collection: bool = False):
         self.base_url = base_url.rstrip('/')
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self.verbose = verbose
@@ -139,6 +139,7 @@ class NewsAIAPITester:
         self.session: Optional[aiohttp.ClientSession] = None
         self.show_response = show_response
         self.response_max_chars = response_max_chars
+        self.skip_collection = skip_collection
         self.validator = ContentValidator()
         
         # IDs de test récupérés dynamiquement
@@ -641,7 +642,7 @@ class NewsAIAPITester:
 
     async def test_admin_endpoints(self):
         """Test des endpoints d'administration"""
-        print("🔧 Test des endpoints Admin...")
+        print("[INFO] Test des endpoints Admin...")
         
         tests = [
             ("/api/v1/admin/diagnose", {
@@ -759,6 +760,114 @@ class NewsAIAPITester:
         
         return passed, failed, warned, content_failed, empty_responses
 
+    async def wait_for_collection_completion(self, max_wait_minutes: int = 10) -> bool:
+        """Attend que la collecte se termine"""
+        print(f"[INFO] Attente de la fin de collecte (max {max_wait_minutes} minutes)...")
+        start_time = time.time()
+        max_wait_seconds = max_wait_minutes * 60
+        
+        while time.time() - start_time < max_wait_seconds:
+            try:
+                # Vérifier le statut de la collecte
+                result = await self.make_request("GET", "/api/v1/admin/collection-status")
+                if result.status == TestStatus.PASS:
+                    # Vérifier le nombre d'articles
+                    articles_result = await self.make_request("GET", "/api/v1/articles?limit=1")
+                    if articles_result.status == TestStatus.PASS and articles_result.response_data:
+                        articles_count = len(articles_result.response_data) if isinstance(articles_result.response_data, list) else 0
+                        if articles_count > 0:
+                            print(f"[INFO] OK Collecte terminee avec des articles disponibles")
+                            return True
+                
+                print(".", end="", flush=True)
+                await asyncio.sleep(10)  # Attendre 10 secondes
+                
+            except Exception as e:
+                print(f"[WARN] Erreur lors de la vérification: {e}")
+                await asyncio.sleep(5)
+        
+        print(f"\n[WARN] Timeout après {max_wait_minutes} minutes")
+        return False
+
+    async def trigger_collection_and_enrichment(self) -> bool:
+        """Déclenche la collecte et l'enrichissement automatiques"""
+        print("\n" + "="*80)
+        print(">> DEMARRAGE AUTOMATIQUE DE LA COLLECTE ET ENRICHISSEMENT")
+        print("="*80)
+        
+        # 1. Déclencher la collecte manuelle
+        print("\n[INFO] (1) Declenchement de la collecte manuelle...")
+        collect_result = await self.make_request("POST", "/api/v1/admin/collect")
+        
+        if collect_result.status != TestStatus.PASS:
+            print(f"[ERROR] Echec de la collecte: {collect_result.message}")
+            return False
+        
+        print(f"[INFO] Collecte lancee: {collect_result.message}")
+        
+        # 2. Attendre que la collecte se termine
+        print("\n[INFO] (2) Attente de la fin de collecte...")
+        if not await self.wait_for_collection_completion():
+            print("[WARN] Collecte peut ne pas etre terminee")
+        
+        # 3. Vérifier le nombre d'articles collectés
+        articles_result = await self.make_request("GET", "/api/v1/admin/diagnose")
+        if articles_result.status == TestStatus.PASS and articles_result.response_data:
+            articles_count = articles_result.response_data.get('articles', {}).get('total', 0)
+            print(f"[INFO] Articles collectes: {articles_count}")
+        
+        # 4. Lancer l'extraction de topics et clustering
+        print("\n[INFO] (3) Extraction de topics et clustering...")
+        topics_result = await self.make_request(
+            "POST", 
+            "/api/v1/admin/process-topics?limit=100&since_hours=24&fallback=true"
+        )
+        
+        if topics_result.status == TestStatus.PASS:
+            print(f"[INFO] Topics extraits: {topics_result.message}")
+        else:
+            print(f"[WARN] Extraction topics echouee: {topics_result.message}")
+        
+        # 5. Lancer l'analyse de sentiment
+        print("\n[INFO] (4) Analyse de sentiment...")
+        sentiment_result = await self.make_request(
+            "POST",
+            "/api/v1/admin/process-sentiment?limit=100&since_hours=24&use_llm=false&fallback=true"
+        )
+        
+        if sentiment_result.status == TestStatus.PASS:
+            print(f"[INFO] Sentiment analyse: {sentiment_result.message}")
+        else:
+            print(f"[WARN] Analyse sentiment echouee: {sentiment_result.message}")
+        
+        # 6. Vérification finale
+        print("\n[INFO] (5) Verification finale...")
+        final_check = await self.make_request("GET", "/api/v1/admin/diagnose")
+        if final_check.status == TestStatus.PASS and final_check.response_data:
+            data = final_check.response_data
+            articles_count = data.get('articles', {}).get('total', 0)
+            sources_count = data.get('sources', {}).get('active', 0)
+            
+            print(f"[INFO] Etat final:")
+            print(f"  - Articles: {articles_count}")
+            print(f"  - Sources actives: {sources_count}")
+            
+            # Test rapide des endpoints enrichis
+            topics_test = await self.make_request("GET", "/api/v1/topics")
+            clusters_test = await self.make_request("GET", "/api/v1/clusters?limit_clusters=5")
+            
+            topics_available = topics_test.status == TestStatus.PASS and topics_test.response_data
+            clusters_available = clusters_test.status == TestStatus.PASS and clusters_test.response_data
+            
+            print(f"  - Topics disponibles: {'OK' if topics_available else 'NOK'}")
+            print(f"  - Clusters disponibles: {'OK' if clusters_available else 'NOK'}")
+        
+        print("\n" + "="*80)
+        print(">> COLLECTE ET ENRICHISSEMENT TERMINES")
+        print("="*80)
+        
+        return True
+
     async def run_all_tests(self, categories: Optional[List[str]] = None):
         """Lance tous les tests ou seulement les catégories spécifiées"""
         
@@ -789,7 +898,25 @@ class NewsAIAPITester:
         else:
             test_categories = all_categories
 
+        # >> NOUVELLE FONCTIONNALITE: Collecte et enrichissement automatiques
+        print("\n" + "="*80)
+        print(">> NEWSAI API - TESTS AUTOMATISES AVEC COLLECTE")
+        print("="*80)
+        
+        # Déclencher la collecte et l'enrichissement avant les tests (si pas désactivé)
+        if not self.skip_collection:
+            collection_success = await self.trigger_collection_and_enrichment()
+            
+            if not collection_success:
+                print("\n[WARN] ! La collecte automatique a echoue, mais les tests continuent...")
+        else:
+            print("\n[INFO] -> Collecte automatique desactivee, passage direct aux tests")
+        
         await self.populate_test_data()
+
+        print("\n" + "="*80)
+        print(">> DEMARRAGE DES TESTS D'ENDPOINTS")
+        print("="*80)
 
         for category, test_method in test_categories.items():
             await test_method()
@@ -799,21 +926,22 @@ class NewsAIAPITester:
 async def main():
     parser = argparse.ArgumentParser(description="Script de test complet pour l'API NewsAI.")
     parser.add_argument("--base-url", type=str, required=True, help="URL de base de l'API (ex: http://localhost:8000)")
-    parser.add_argument("--timeout", type=int, default=30, help="Délai d'attente maximum pour chaque requête en secondes")
-    parser.add_argument("--verbose", action="store_true", help="Afficher les détails de chaque test")
-    parser.add_argument("--no-response-preview", action="store_false", dest="show_response", help="Ne pas afficher l'aperçu de la réponse API pour les tests individuels")
-    parser.add_argument("--response-max-chars", type=int, default=2000, help="Nombre maximal de caractères à afficher pour l'aperçu de la réponse API")
-    parser.add_argument("--only", type=str, help="Exécuter seulement certaines catégories de tests (ex: health,articles)")
+    parser.add_argument("--timeout", type=int, default=30, help="Delai d'attente maximum pour chaque requete en secondes")
+    parser.add_argument("--verbose", action="store_true", help="Afficher les details de chaque test")
+    parser.add_argument("--no-response-preview", action="store_false", dest="show_response", help="Ne pas afficher l'apercu de la reponse API pour les tests individuels")
+    parser.add_argument("--response-max-chars", type=int, default=2000, help="Nombre maximal de caracteres a afficher pour l'apercu de la reponse API")
+    parser.add_argument("--only", type=str, help="Executer seulement certaines categories de tests (ex: health,articles)")
+    parser.add_argument("--skip-collection", action="store_true", help="Ignorer la collecte automatique et passer directement aux tests")
     
     args = parser.parse_args()
 
-    # Convertir les catégories en liste si spécifiées
+    # Convertir les categories en liste si specifiees
     only_categories = [cat.strip() for cat in args.only.split(',')] if args.only else None
 
-    print(f"[START] Démarrage des tests de l'API NewsAI à l'adresse: {args.base_url}")
-    print(f"[TIMEOUT] Timeout par requête: {args.timeout}s")
+    print(f"[START] Demarrage des tests de l'API NewsAI a l'adresse: {args.base_url}")
+    print(f"[TIMEOUT] Timeout par requete: {args.timeout}s")
     if only_categories:
-        print(f"[CATEGORIES] Catégories de tests sélectionnées: {', '.join(only_categories)}")
+        print(f"[CATEGORIES] Categories de tests selectionnees: {', '.join(only_categories)}")
     print("-" * 70)
 
     tester = None
@@ -823,15 +951,16 @@ async def main():
             timeout=args.timeout, 
             verbose=args.verbose, 
             show_response=args.show_response,
-            response_max_chars=args.response_max_chars
+            response_max_chars=args.response_max_chars,
+            skip_collection=args.skip_collection
         ) as tester:
             await tester.run_all_tests(categories=only_categories)
     except aiohttp.ClientConnectorError as e:
-        print(f"\n[CRITICAL ERROR] Impossible de se connecter à l'API à l'adresse {args.base_url}.")
-        print(f"Vérifiez que l'API est en cours d'exécution et accessible. Détails: {e}")
+        print(f"\n[CRITICAL ERROR] Impossible de se connecter a l'API a l'adresse {args.base_url}.")
+        print(f"Verifiez que l'API est en cours d'execution et accessible. Details: {e}")
         sys.exit(1)
     except Exception as e:
-        print(f"\n[UNEXPECTED ERROR] lors de l'exécution des tests: {e}")
+        print(f"\n[UNEXPECTED ERROR] lors de l'execution des tests: {e}")
         traceback.print_exc()
         sys.exit(1)
     finally:
@@ -840,13 +969,13 @@ async def main():
             passed, failed, warned, content_failed, empty_responses = tester.print_summary()
             
             if failed > 0 or content_failed > 0 or empty_responses > 0:
-                print("\n[ALERT] DES TESTS ONT ÉCHOUÉ OU PRÉSENTENT DES PROBLÈMES DE CONTENU.")
+                print("\n[ALERT] DES TESTS ONT ECHOUE OU PRESENTENT DES PROBLEMES DE CONTENU.")
                 sys.exit(1)
             elif warned > 0:
-                print("\n[WARNING] TOUS LES TESTS TECHNIQUES ONT RÉUSSI, MAIS DES AVERTISSEMENTS ONT ÉTÉ ÉMIS (e.g., 404).")
-                sys.exit(0) # Sortie réussie car ce sont des avertissements
+                print("\n[WARNING] TOUS LES TESTS TECHNIQUES ONT REUSSI, MAIS DES AVERTISSEMENTS ONT ETE EMIS (e.g., 404).")
+                sys.exit(0) # Sortie reussie car ce sont des avertissements
             else:
-                print("\n[SUCCESS] TOUS LES TESTS ONT RÉUSSI AVEC SUCCÈS !")
+                print("\n[SUCCESS] TOUS LES TESTS ONT REUSSI AVEC SUCCES !")
                 sys.exit(0)
 
 if __name__ == "__main__":

@@ -14,6 +14,8 @@ from sqlalchemy.dialects.postgresql import insert
 
 from ..core.models import Source, Article
 from ..core.db import get_session
+from .dedupe import content_hash
+from .sitemap import discover_from_sitemap
 
 logger = logging.getLogger(__name__)
 
@@ -119,8 +121,8 @@ class CollectorService:
     
     def generate_content_hash(self, title: str, url: str) -> str:
         """Génère un hash unique pour le contenu"""
-        content = f"{title}|{url}".encode('utf-8')
-        return hashlib.sha256(content).hexdigest()
+        content = f"{title}|{url}"
+        return content_hash(content)
     
     def normalize_url(self, url: str) -> str:
         """Normalise une URL"""
@@ -210,13 +212,15 @@ class CollectorService:
                 
                 if not content:
                     logger.warning(f"No content retrieved for {source.feed_url}")
-                    return {"success": 0, "failed": 1, "articles": 0}
+                    # Fallback: try sitemap discovery
+                    return await self.process_source_via_sitemap(db, source)
                 
                 articles_data = self.parse_rss_feed(content, source.feed_url)
                 
                 if not articles_data:
                     logger.warning(f"No articles parsed for {source.feed_url}")
-                    return {"success": 1, "failed": 0, "articles": 0}
+                    # Fallback: try sitemap discovery
+                    return await self.process_source_via_sitemap(db, source)
                 
                 saved_count = await self.save_articles(db, source, articles_data)
                 
@@ -274,6 +278,49 @@ async def run_collection_once(db: AsyncSession) -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"[collector] Collection cycle failed: {e}")
         return {"success": 0, "failed": 1, "articles": 0, "error": str(e)}
+    
+    async def process_source_via_sitemap(self, db: AsyncSession, source: Source) -> Dict[str, Any]:
+        """Fallback: découverte d'articles via sitemap"""
+        try:
+            logger.info(f"Trying sitemap discovery for {source.site_domain}")
+            
+            # Discover URLs from sitemap
+            sitemap_urls = discover_from_sitemap(source.site_domain, limit=20)
+            
+            if not sitemap_urls:
+                logger.warning(f"No URLs found in sitemap for {source.site_domain}")
+                return {"success": 0, "failed": 1, "articles": 0}
+            
+            # Convert sitemap URLs to article data format
+            articles_data = []
+            for url_info in sitemap_urls:
+                url = url_info.get("url", "")
+                if url:
+                    # Extract title from URL path as fallback
+                    path_parts = url.rstrip('/').split('/')
+                    title = path_parts[-1].replace('-', ' ').replace('_', ' ').title() if path_parts else "Article"
+                    
+                    articles_data.append({
+                        'title': title,
+                        'url': url,
+                        'canonical_url': url,
+                        'summary_feed': f"Article discovered from sitemap: {source.site_domain}",
+                        'published_at': self.parse_date(None),  # Current time as fallback
+                        'authors': None,
+                        'full_text': None,
+                        'lang': None
+                    })
+            
+            if articles_data:
+                saved_count = await self.save_articles(db, source, articles_data)
+                logger.info(f"Sitemap discovery for {source.name}: {saved_count} articles saved")
+                return {"success": 1, "failed": 0, "articles": saved_count, "method": "sitemap"}
+            else:
+                return {"success": 0, "failed": 1, "articles": 0}
+                
+        except Exception as e:
+            logger.error(f"Sitemap discovery failed for {source.site_domain}: {e}")
+            return {"success": 0, "failed": 1, "articles": 0, "error": str(e)}
 
 async def get_collection_health() -> Dict[str, Any]:
     """Vérifie la santé de la collecte"""

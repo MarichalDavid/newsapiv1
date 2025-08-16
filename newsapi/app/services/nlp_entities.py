@@ -3,6 +3,14 @@ import re
 from typing import Dict, List
 from functools import lru_cache
 
+# Import du service de mots-clés amélioré
+try:
+    from .nlp_keywords import extract_keywords
+    YAKE_AVAILABLE = True
+except ImportError:
+    YAKE_AVAILABLE = False
+    print("⚠️ YAKE not available for keyword extraction")
+
 # 🔧 CORRECTION: Extraction d'entités légère basée sur des patterns
 class LightweightNER:
     """Extracteur d'entités nommées léger basé sur des règles et patterns"""
@@ -126,6 +134,31 @@ def extract_entities(text: str, lang: str = "en") -> Dict[str, List[str]]:
     except Exception as e:
         print(f"[nlp_entities] Error extracting entities: {e}")
         return {}
+
+def extract_enhanced_keywords(text: str, lang: str = "en", topk: int = 12) -> List[str]:
+    """
+    Extraction de mots-clés améliorée avec YAKE si disponible, 
+    sinon fallback sur extraction basique.
+    """
+    if not text:
+        return []
+    
+    if YAKE_AVAILABLE:
+        try:
+            return extract_keywords(text, lang, topk)
+        except Exception as e:
+            print(f"[nlp_entities] YAKE extraction failed: {e}")
+    
+    # Fallback: extraction basique par fréquence
+    words = re.findall(r'\b[a-zA-Z]{4,}\b', text.lower())
+    word_freq = {}
+    for word in words:
+        if word not in ['this', 'that', 'with', 'have', 'will', 'from', 'they', 'been', 'said', 'each', 'which', 'their', 'time', 'were', 'more', 'about', 'after', 'first', 'would', 'there', 'could', 'other']:
+            word_freq[word] = word_freq.get(word, 0) + 1
+    
+    # Retourne les mots les plus fréquents
+    sorted_words = sorted(word_freq.items(), key=lambda x: x[1], reverse=True)
+    return [word for word, _ in sorted_words[:topk]]
 
 # 🔧 FONCTION BONUS: Extraction d'entités spécifiques pour l'actualité
 def extract_news_entities(text: str) -> Dict[str, List[str]]:
